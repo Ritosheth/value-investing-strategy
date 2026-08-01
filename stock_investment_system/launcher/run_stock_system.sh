@@ -21,6 +21,7 @@ cd "$PROJECT_DIR"
 if "$SYSTEM_DIR/env.sh" -m stock_investment_system.run_models \
     --model "$MODEL" \
     --max-watchlist "$MAX_WATCHLIST" \
+    --live-universe \
     --refresh-quotes \
     --format csv > "$TEMP_FILE" 2> "$ERROR_FILE"; then
   if [ ! -s "$TEMP_FILE" ]; then

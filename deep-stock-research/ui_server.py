@@ -161,6 +161,12 @@ def run_job(job_id: str, payload: dict[str, Any], codes: list[str]) -> None:
             str(payload.get("horizon") or "MEDIUM").upper(),
             "--language",
             "zh-CN",
+            "--risk-profile",
+            str(payload.get("risk") or "平衡"),
+            "--investment-style",
+            str(payload.get("style") or "未指定"),
+            "--research-depth",
+            str(payload.get("depth") or "标准尽调"),
             "--evidence-json",
             str(evidence_path),
         ]

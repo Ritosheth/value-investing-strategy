@@ -10,12 +10,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "collect_deep_research_data.py"
+EVIDENCE_SCRIPT = ROOT / "scripts" / "collect_futu_evidence.py"
+EVALUATOR_SCRIPT = ROOT / "scripts" / "evaluate_research_history.py"
 
 
 def load_collector():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("collect_deep_research_data", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_evidence_collector():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("collect_futu_evidence", EVIDENCE_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_evaluator():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("evaluate_research_history", EVALUATOR_SCRIPT)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
@@ -118,6 +140,53 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result["position_band"], "4%-6%")
         self.assertEqual(result["hard_limits"], [])
 
+    def test_financial_quality_is_derived_from_statement_metrics(self):
+        collector = load_evidence_collector()
+        financials = {"data": {"report_list": [{
+            "date_time_str": "2026-06-30",
+            "item_list": [
+                {"field_id": 3015, "data": 20},
+                {"field_id": 3019, "data": 15, "yoy": 10},
+                {"field_id": 3048, "data": 10},
+                {"field_id": 3049, "data": 20},
+                {"field_id": 3054, "data": 120, "yoy": 0},
+                {"field_id": 3064, "data": 40},
+            ],
+        }]}}
+
+        score, basis, metrics = collector.derive_financial_quality_score(financials, [])
+
+        self.assertGreater(score, 60)
+        self.assertIn("ROE", basis)
+        self.assertEqual(metrics["debt_to_assets"], 40)
+
+    def test_valuation_score_prefers_historical_percentile(self):
+        collector = load_evidence_collector()
+        valuation = {"data": {"trend": {"valuation_percentile": 80}}}
+
+        score, basis = collector.derive_valuation_score(valuation, [{"valuation_score": 99}])
+
+        self.assertEqual(score, 20)
+        self.assertIn("历史估值分位", basis)
+
+    def test_multiline_json_is_extracted_from_futu_sdk_logs(self):
+        collector = load_evidence_collector()
+        output = '2026-08-01 | [open_context] connected\n[\n  {"model_name": "quality"}\n]\n2026-08-01 disconnected'
+
+        parsed = collector.parse_json_output(output)
+
+        self.assertEqual(parsed, [{"model_name": "quality"}])
+
+    def test_research_history_forward_return_is_reproducible(self):
+        evaluator = load_evaluator()
+        rows = [{"as_of": "2026-01-01", "code": "300750.SZ", "current_price": "100"}]
+
+        result = evaluator.evaluate_rows(rows, {"300750.SZ": 110.0}, date(2026, 2, 1))
+
+        self.assertEqual(result[0]["holding_days"], 31)
+        self.assertEqual(result[0]["forward_return_pct"], 10.0)
+        self.assertIsNone(result[0]["excess_return_pct"])
+
     def test_missing_critical_evidence_forces_insufficient_evidence(self):
         collector = load_collector()
 
@@ -126,6 +195,36 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result["posture"], "INSUFFICIENT EVIDENCE")
         self.assertEqual(result["position_band"], "0%")
         self.assertIn("financial_quality", result["unavailable_components"])
+
+    def test_reliable_valuation_downside_forces_reject_and_zero_position(self):
+        collector = load_collector()
+        score = collector.score_research({
+            "model": {"score": 85}, "financial_quality": {"score": 85},
+            "valuation": {"score": 70}, "catalyst": {"score": 75},
+            "technical_flow": {"score": 80}, "governance_risk": {"score": 70},
+            "data_confidence": {"score": 90},
+        })
+        fair_value = {"available": True, "multiple_sample_size": 100, "scenarios": {"base": {"upside_pct": -45}}}
+
+        constrained = collector.apply_valuation_constraints(score, fair_value, {"available": False})
+
+        self.assertEqual(constrained["posture"], "REJECT-RISK WATCH")
+        self.assertEqual(constrained["position_band"], "0%")
+        self.assertIn("reliable_valuation_downside_below_20pct", constrained["hard_limits"])
+
+    def test_insufficient_valuation_sample_does_not_force_reject(self):
+        collector = load_collector()
+        score = collector.score_research({
+            "model": {"score": 85}, "financial_quality": {"score": 85},
+            "valuation": {"score": 70}, "catalyst": {"score": 75},
+            "technical_flow": {"score": 80}, "governance_risk": {"score": 70},
+            "data_confidence": {"score": 90},
+        })
+        fair_value = {"available": True, "multiple_sample_size": 1, "scenarios": {"base": {"upside_pct": -45}}}
+
+        constrained = collector.apply_valuation_constraints(score, fair_value, {"available": False})
+
+        self.assertNotIn("reliable_valuation_downside_below_20pct", constrained["hard_limits"])
 
     def test_fair_value_uses_ttm_eps_and_recent_pe_percentiles(self):
         collector = load_collector()
@@ -291,6 +390,17 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result["capital_structure"]["share_basis"], "EBIT ÷ 每股 EBIT")
         self.assertLess(result["capital_structure"]["net_debt_per_share"], 0)
         self.assertEqual(result["historical_inputs"]["revenue_growth_basis"], "利润表绝对营业收入近3年 CAGR")
+
+    def test_dcf_forecast_years_follow_research_horizon(self):
+        collector = load_collector()
+
+        short = collector.derive_dcf_valuation(self.dcf_evidence(), "SHORT")
+        long = collector.derive_dcf_valuation(self.dcf_evidence(), "LONG")
+
+        self.assertEqual(short["forecast_years"], 3)
+        self.assertEqual(short["method"], "3-year two-stage FCFF DCF")
+        self.assertEqual(long["forecast_years"], 7)
+        self.assertEqual(long["method"], "7-year two-stage FCFF DCF")
 
     def test_dcf_valuation_excludes_financial_companies(self):
         collector = load_collector()

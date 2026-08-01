@@ -35,8 +35,8 @@ def run(
         params["initial_quality_weights"],
         ("fundamental_quality_score", "growth_quality_score", "valuation_score", "price_volume_score"),
     )
+    scored = enrich_valuation(client, scored, count=max(config.max_market_candidates, config.max_watchlist))
     scored = recompute_quality_total(scored, weights=initial_weights)
-    scored = enrich_valuation(client, scored, count=config.max_watchlist)
     scored = enrich_corporate_actions(client, scored, count=config.max_watchlist)
     scored["total_score"] = weighted_score(scored, params["total_score_weights"]).round(2)
     scored = add_rotation_overlay(scored)
@@ -68,6 +68,8 @@ def run(
         "turnover_amount",
         "float_market_cap",
         "price_source",
+        "score_input_mode",
+        "feature_coverage",
         "risk_flags",
         "selection_reason",
     ]

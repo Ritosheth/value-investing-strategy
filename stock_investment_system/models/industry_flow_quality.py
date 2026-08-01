@@ -4,7 +4,7 @@ import pandas as pd
 
 from ..config import SelectionConfig
 from ..futu_client import FutuClient
-from ..futu_models import add_entry_position_context, add_rotation_overlay, build_quality_base, derive_industry_strength, enrich_flow
+from ..futu_models import add_entry_position_context, add_rotation_overlay, build_quality_base, derive_industry_strength, enrich_flow, enrich_valuation
 from ..parameters import model_parameters, parameter_metadata, weighted_score
 from ..scoring import ModelResult, top_watchlist
 from ..utils import safe_merge
@@ -27,11 +27,12 @@ def run(
     scored, rejected, metadata = build_quality_base(client, config)
     plate_counts = client.plate_metadata()
 
+    candidate_count = max(config.max_watchlist * 4, config.max_market_candidates, 60)
+    scored = enrich_valuation(client, scored, count=candidate_count)
+
     scored["stock_quality_blend"] = weighted_score(scored, params["stock_quality_blend_weights"]).round(2)
     scored["total_score"] = weighted_score(scored, params["pre_industry_score_weights"]).round(2)
 
-    candidate_count = max(config.max_watchlist * 4, config.max_market_candidates, 60)
-    scored["stock_quality_blend"] = weighted_score(scored, params["stock_quality_blend_weights"]).round(2)
     scored["pre_industry_score"] = weighted_score(scored, params["pre_industry_score_weights"]).round(2)
     scored = enrich_flow(client, scored, count=candidate_count, rank_col="pre_industry_score")
 
@@ -67,6 +68,8 @@ def run(
         "growth_quality_score",
         "valuation_score",
         "industry_strength_score",
+        "industry_member_count",
+        "industry_coverage_ratio",
         "industry_net_flow",
         "industry_pct_change",
         "rotation_state",
@@ -88,6 +91,8 @@ def run(
         "pb",
         "turnover_amount",
         "price_source",
+        "score_input_mode",
+        "feature_coverage",
         "risk_flags",
         "selection_reason",
     ]

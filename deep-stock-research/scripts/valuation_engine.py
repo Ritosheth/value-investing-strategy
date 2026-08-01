@@ -34,6 +34,7 @@ MARKET_ASSUMPTIONS = {
 
 def derive_dcf_valuation(evidence: dict[str, Any], horizon: str = "MEDIUM") -> dict[str, Any]:
     """Return a three-scenario per-share FCFF DCF or an explicit gap reason."""
+    forecast_years = {"SHORT": 3, "MEDIUM": 5, "LONG": 7}.get(str(horizon).upper(), 5)
     market = _market(evidence)
     defaults = MARKET_ASSUMPTIONS.get(market, MARKET_ASSUMPTIONS["A"])
     current_price = _current_price(evidence)
@@ -148,6 +149,7 @@ def derive_dcf_valuation(evidence: dict[str, Any], horizon: str = "MEDIUM") -> d
             assumptions["wacc"],
             assumptions["terminal_growth"],
             net_debt_per_share,
+            forecast_years,
         )
         scenarios[key] = {
             "label": assumptions["label"],
@@ -169,7 +171,7 @@ def derive_dcf_valuation(evidence: dict[str, Any], horizon: str = "MEDIUM") -> d
         row = {"wacc_pct": round(test_wacc * 100.0, 2), "values": []}
         for test_growth in sensitivity_growth:
             safe_growth = min(test_growth, test_wacc - 0.01)
-            result = _dcf_value(latest_revenue, base_growth, normalized_margin, test_wacc, safe_growth, net_debt_per_share)
+            result = _dcf_value(latest_revenue, base_growth, normalized_margin, test_wacc, safe_growth, net_debt_per_share, forecast_years)
             row["values"].append({
                 "terminal_growth_pct": round(safe_growth * 100.0, 2),
                 "value": round(max(0.0, result["equity_value_per_share"]), 2),
@@ -183,6 +185,7 @@ def derive_dcf_valuation(evidence: dict[str, Any], horizon: str = "MEDIUM") -> d
         wacc=wacc,
         terminal_growth=terminal_growth,
         net_debt_per_share=net_debt_per_share,
+        forecast_years=forecast_years,
     )
     mad = median([abs(value - normalized_margin) for value in ratios])
     dispersion = mad / abs(normalized_margin) if normalized_margin else 99.0
@@ -205,9 +208,10 @@ def derive_dcf_valuation(evidence: dict[str, Any], horizon: str = "MEDIUM") -> d
 
     return {
         "available": True,
-        "method": "5-year two-stage FCFF DCF",
+        "method": f"{forecast_years}-year two-stage FCFF DCF",
         "model": "non-financial corporate FCFF",
         "horizon": horizon,
+        "forecast_years": forecast_years,
         "currency": defaults["currency"],
         "current_price": round(current_price, 2),
         "confidence": confidence,
@@ -262,18 +266,19 @@ def _dcf_value(
     wacc: float,
     terminal_growth: float,
     net_debt_per_share: float,
+    forecast_years: int = 5,
 ) -> dict[str, float]:
     if terminal_growth >= wacc:
         raise ValueError("terminal growth must be below WACC")
     revenue = revenue_per_share
     pv_explicit = 0.0
     fcff = 0.0
-    for year in range(1, 6):
+    for year in range(1, forecast_years + 1):
         revenue *= 1.0 + revenue_growth
         fcff = revenue * fcff_margin
         pv_explicit += fcff / ((1.0 + wacc) ** year)
     terminal_value = fcff * (1.0 + terminal_growth) / (wacc - terminal_growth)
-    pv_terminal = terminal_value / ((1.0 + wacc) ** 5)
+    pv_terminal = terminal_value / ((1.0 + wacc) ** forecast_years)
     return {
         "pv_explicit": pv_explicit,
         "pv_terminal": pv_terminal,
@@ -290,11 +295,12 @@ def _solve_implied_growth(
     wacc: float,
     terminal_growth: float,
     net_debt_per_share: float,
+    forecast_years: int = 5,
 ) -> dict[str, Any]:
     low, high = -0.20, 0.50
 
     def price(growth: float) -> float:
-        return _dcf_value(revenue_per_share, growth, fcff_margin, wacc, terminal_growth, net_debt_per_share)["equity_value_per_share"]
+        return _dcf_value(revenue_per_share, growth, fcff_margin, wacc, terminal_growth, net_debt_per_share, forecast_years)["equity_value_per_share"]
 
     low_value, high_value = price(low), price(high)
     if target_price < low_value:
@@ -311,7 +317,7 @@ def _solve_implied_growth(
     return {
         "available": True,
         "annual_revenue_growth_pct": round(result * 100.0, 2),
-        "interpretation": "在基准 FCFF 利润率、WACC 和永续增长率不变时，当前股价隐含的未来 5 年年均收入增速",
+        "interpretation": f"在基准 FCFF 利润率、WACC 和永续增长率不变时，当前股价隐含的未来 {forecast_years} 年年均收入增速",
     }
 
 

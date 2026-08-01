@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ class FutuClient:
     port: int = 11111
     warnings: list[str] = field(default_factory=list)
     _quote_ctx: Any = field(default=None, init=False, repr=False)
+    _live_universe_cache: pd.DataFrame | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_sample(cls) -> "FutuClient":
@@ -46,12 +48,96 @@ class FutuClient:
             self.warnings.append(message)
 
     def market_candidates(self, config: SelectionConfig) -> pd.DataFrame:
+        if config.live_market_screen:
+            live = self._live_universe_cache
+            if live is None:
+                live = self._stock_screen_candidates(config)
+                self._live_universe_cache = live.copy()
+            if not live.empty:
+                return live.copy().head(config.max_market_candidates)
+            self.warn("Live full-market screen unavailable; falling back to the configured seed universe.")
         if self.base_data is not None:
-            return self.base_data.copy().head(config.max_market_candidates)
+            out = self.base_data.copy().head(config.max_market_candidates)
+            if "data_source" not in out:
+                out["data_source"] = "configured_seed_universe"
+            return out
         if config.seed_codes:
             return self._snapshot_candidates(config.seed_codes)
         self.warn("No base universe supplied. Use FutuClient.from_sample(), from_csv(), or config.seed_codes.")
         return pd.DataFrame()
+
+    def _stock_screen_candidates(self, config: SelectionConfig) -> pd.DataFrame:
+        """Read a liquid CN-market universe from Futu's V2 stock screen.
+
+        The screen supplies current raw factors.  Saved CSV scores are never
+        sent through this path, which prevents a stale score column from being
+        mistaken for current evidence.
+        """
+
+        try:  # pragma: no cover - depends on OpenD/SDK permissions
+            from futu import StockScreenRequest
+            from futu.quote.stock_screen_const import (
+                BasicProperty,
+                CumulativeProperty,
+                FinancialProperty,
+                ScrMarket,
+                ScrSortDir,
+                SimpleField,
+                SimpleProperty,
+                Term,
+            )
+
+            request = StockScreenRequest()
+            request.page_from = 0
+            request.page_count = min(200, max(1, int(config.max_market_candidates)))
+            request.add_simple_field(field=int(SimpleField.MARKET), values=[int(ScrMarket.CN)])
+            request.add_simple_property(name=int(SimpleProperty.PRICE), lower=0.01)
+            request.add_simple_property(name=int(SimpleProperty.LISTED_DAYS), lower=int(config.min_listed_days))
+            if config.min_turnover_amount > 0:
+                request.add_cumulative_property(
+                    name=int(CumulativeProperty.AVG_TURNOVER),
+                    days=20,
+                    lower=float(config.min_turnover_amount),
+                )
+            if config.min_float_market_cap > 0:
+                request.add_financial_property(
+                    name=int(FinancialProperty.FLOAT_MARKET_CAP),
+                    term=int(Term.LATEST),
+                    lower=float(config.min_float_market_cap),
+                )
+            for name in (BasicProperty.CODE, BasicProperty.NAME, BasicProperty.INDUSTRY):
+                request.add_retrieve_basic(name=int(name))
+            for name in (SimpleProperty.PRICE, SimpleProperty.MARKET_CAP, SimpleProperty.PE_TTM, SimpleProperty.PB, SimpleProperty.LISTED_DAYS):
+                request.add_retrieve_simple(name=int(name))
+            request.add_retrieve_cumulative(name=int(CumulativeProperty.AVG_TURNOVER), days=20)
+            request.add_retrieve_cumulative(name=int(CumulativeProperty.PRICE_CHANGE_PCT), days=20)
+            for name in (
+                FinancialProperty.FLOAT_MARKET_CAP,
+                FinancialProperty.ROE,
+                FinancialProperty.REVENUE_GROWTH,
+                FinancialProperty.NET_PROFIT_CASH_COVER_TTM,
+                FinancialProperty.DEBT_TO_ASSETS,
+            ):
+                request.add_retrieve_financial(name=int(name), term=int(Term.LATEST))
+            request.set_sort(
+                direction=int(ScrSortDir.DESC),
+                property_type="cumulative",
+                property_params={"name": int(CumulativeProperty.AVG_TURNOVER), "days": 20},
+            )
+            ret, data = self._quote_context().get_stock_screen(request)
+            if ret != 0:
+                self.warn(f"live stock screen failed: {data}")
+                return pd.DataFrame()
+            _, all_count, items = data
+            out = _normalize_stock_screen_items(items or [])
+            if not out.empty:
+                out["screen_total_count"] = int(all_count)
+            else:
+                self.warn(f"live stock screen returned {all_count} matches but no parseable rows")
+            return out
+        except Exception as exc:
+            self.warn(f"live stock screen unavailable: {exc}")
+            return pd.DataFrame()
 
     def refresh_market_snapshot(self) -> None:
         """Refresh quote fields for the current base universe from Futu OpenD."""
@@ -90,6 +176,7 @@ class FutuClient:
                 base = base.drop(columns=[live_column])
         base["price_source"] = base["latest_price_live_source"].fillna(base.get("price_source", "sample"))
         base = base.drop(columns=["latest_price_live_source"])
+        base["quote_as_of"] = datetime.now().astimezone().isoformat(timespec="seconds")
         self.base_data = base
 
     def valuation(self, codes: list[str]) -> pd.DataFrame:
@@ -99,6 +186,10 @@ class FutuClient:
         if snapshot.empty:
             return pd.DataFrame(columns=["code", "pe_dynamic", "pb"])
         return snapshot.reindex(columns=["code", "pe_dynamic", "pb"])
+
+    def market_snapshot(self, codes: list[str]) -> pd.DataFrame:
+        """Public read-only snapshot helper for research outcome evaluation."""
+        return self._snapshot_candidates(codes)
 
     def corporate_actions(self, codes: list[str]) -> pd.DataFrame:
         if self.corporate_action_data is not None:
@@ -260,6 +351,9 @@ def _normalize_snapshot(data: pd.DataFrame) -> pd.DataFrame:
     _copy_first_available(out, "float_market_cap", ["float_market_cap", "circular_market_val", "float_market_val"])
     _copy_first_available(out, "pe_dynamic", ["pe_ttm_ratio", "pe_ratio", "pe_dynamic"])
     _copy_first_available(out, "pb", ["pb_ratio", "pb"])
+    out["price_source"] = "live_futu_snapshot"
+    out["data_source"] = "explicit_target_snapshot"
+    out["quote_as_of"] = datetime.now().astimezone().isoformat(timespec="seconds")
     return out
 
 
@@ -280,6 +374,102 @@ def _quote_update_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
     updates = out[existing].copy()
     updates["latest_price_live_source"] = "live_futu_snapshot"
     return updates.drop_duplicates("code")
+
+
+def _normalize_stock_screen_items(items: list[dict[str, Any]]) -> pd.DataFrame:
+    property_names: dict[str, dict[int, str]] = {
+        "basic": {1101: "CODE", 1102: "NAME", 1103: "INDUSTRY"},
+        "simple": {2201: "PRICE", 2301: "MARKET_CAP", 2303: "PE_TTM", 2304: "PB", 2307: "LISTED_DAYS"},
+        "cumulative": {3105: "AVG_TURNOVER", 3102: "PRICE_CHANGE_PCT"},
+        "financial": {
+            4903: "FLOAT_MARKET_CAP", 4110: "ROE", 4106: "REVENUE_GROWTH",
+            4211: "NET_PROFIT_CASH_COVER_TTM", 4109: "DEBT_TO_ASSETS",
+        },
+    }
+    try:
+        from futu.quote.stock_screen_const import BasicProperty, CumulativeProperty, FinancialProperty, SimpleProperty
+
+        for kind, enum_cls in (
+            ("basic", BasicProperty),
+            ("simple", SimpleProperty),
+            ("cumulative", CumulativeProperty),
+            ("financial", FinancialProperty),
+        ):
+            property_names[kind].update({
+                int(getattr(enum_cls, name)): name
+                for name in dir(enum_cls)
+                if name.isupper() and not name.startswith("_")
+            })
+    except Exception:
+        pass
+
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        values = {str(key).upper(): value for key, value in item.items() if key != "results"}
+        for result in item.get("results", []) if isinstance(item.get("results"), list) else []:
+            if not isinstance(result, dict):
+                continue
+            kind = str(result.get("type") or "")
+            prop = result.get("property", {})
+            prop_id = prop.get("name") if isinstance(prop, dict) else None
+            try:
+                name = property_names.get(kind, {}).get(int(prop_id), str(prop_id))
+            except (TypeError, ValueError):
+                name = str(prop_id)
+            value = next((result.get(key) for key in ("dval", "ival", "sval", "bval") if result.get(key) is not None), None)
+            values[name.upper()] = value
+        raw_code = str(values.get("CODE") or "").strip()
+        if not raw_code:
+            continue
+        futu_code = raw_code if "." in raw_code else _infer_futu_code(raw_code)
+        rows.append(
+            {
+                "futu_code": futu_code,
+                "code": _plain_code(futu_code),
+                "name": values.get("NAME") or _plain_code(futu_code),
+                "industry": values.get("INDUSTRY") or "unknown",
+                "latest_price": values.get("PRICE"),
+                # V2 returns average turnover in cents and financial statement
+                # market-cap fields in thousands of currency units.
+                "turnover_amount": _divide_numeric(values.get("AVG_TURNOVER"), 100.0),
+                "float_market_cap": _divide_numeric(values.get("FLOAT_MARKET_CAP"), 1000.0) or values.get("MARKET_CAP"),
+                "pe_dynamic": values.get("PE_TTM"),
+                "pb": values.get("PB"),
+                "listed_days": values.get("LISTED_DAYS"),
+                "pct_change_20d": _multiply_numeric(values.get("PRICE_CHANGE_PCT"), 100.0),
+                "roe": _multiply_numeric(values.get("ROE"), 100.0),
+                "revenue_growth": _multiply_numeric(values.get("REVENUE_GROWTH"), 100.0),
+                "net_profit_cash_cover": _multiply_numeric(values.get("NET_PROFIT_CASH_COVER_TTM"), 100.0),
+                "debt_to_assets": _multiply_numeric(values.get("DEBT_TO_ASSETS"), 100.0),
+                "risk_flags": "",
+                "price_source": "live_futu_stock_screen",
+                "data_source": "live_futu_stock_screen",
+                "quote_as_of": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _infer_futu_code(code: str) -> str:
+    plain = _plain_code(code)
+    market = "SH" if plain.startswith(("5", "6")) else "BJ" if plain.startswith(("4", "8")) else "SZ"
+    return f"{market}.{plain}"
+
+
+def _divide_numeric(value: Any, divisor: float) -> float | None:
+    try:
+        return float(value) / divisor if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _multiply_numeric(value: Any, multiplier: float) -> float | None:
+    try:
+        return float(value) * multiplier if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _copy_first_available(df: pd.DataFrame, target: str, candidates: list[str]) -> None:

@@ -1,5 +1,7 @@
 # Stock Investment System
 
+完整选股规则、估值约束和当前局限见根目录 `SYSTEM_RULES_AND_LIMITATIONS.md`。
+
 This directory contains the installed model layer from the supplied package.
 
 ## Installed Files

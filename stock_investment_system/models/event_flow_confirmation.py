@@ -4,7 +4,7 @@ import pandas as pd
 
 from ..config import SelectionConfig
 from ..futu_client import FutuClient
-from ..futu_models import add_entry_position_context, add_rotation_overlay, build_quality_base, enrich_corporate_actions, enrich_events, enrich_flow
+from ..futu_models import add_entry_position_context, add_rotation_overlay, build_quality_base, enrich_corporate_actions, enrich_events, enrich_flow, enrich_valuation
 from ..parameters import model_parameters, parameter_metadata, weighted_score
 from ..scoring import ModelResult, top_watchlist
 
@@ -24,10 +24,11 @@ def run(
 ) -> ModelResult:
     params = model_parameters("model3_event_flow_confirmation", config)
     scored, rejected, metadata = build_quality_base(client, config)
+    candidate_count = max(config.max_flow_candidates, config.max_watchlist * 3)
+    scored = enrich_valuation(client, scored, count=candidate_count)
     scored["stock_quality_blend"] = weighted_score(scored, params["stock_quality_blend_weights"]).round(2)
     scored["pre_event_score"] = weighted_score(scored, params["pre_event_score_weights"]).round(2)
 
-    candidate_count = max(config.max_flow_candidates, config.max_watchlist * 3)
     scored = enrich_events(client, scored, count=candidate_count, rank_col="pre_event_score")
     scored = enrich_corporate_actions(client, scored, count=candidate_count, rank_col="pre_event_score")
     if "event_score" not in scored:
@@ -98,6 +99,8 @@ def run(
         "pb",
         "turnover_amount",
         "price_source",
+        "score_input_mode",
+        "feature_coverage",
         "risk_flags",
         "selection_reason",
     ]

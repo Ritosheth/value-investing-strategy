@@ -129,6 +129,45 @@ def position_band(posture: str, confidence: str, hard_limits: list[str], unavail
     return "0%"
 
 
+def apply_valuation_constraints(
+    research_score: dict[str, Any],
+    fair_value: dict[str, Any],
+    dcf_valuation: dict[str, Any],
+    risk_profile: str = "平衡",
+) -> dict[str, Any]:
+    """Apply only sufficiently evidenced valuation anchors to the decision."""
+    out = dict(research_score)
+    out["hard_limits"] = list(research_score.get("hard_limits", []))
+    out["unavailable_components"] = list(research_score.get("unavailable_components", []))
+    anchors: dict[str, float] = {}
+    if fair_value.get("available") and int(fair_value.get("multiple_sample_size") or 0) >= 30:
+        upside = _numeric(fair_value.get("scenarios", {}).get("base", {}).get("upside_pct"))
+        if upside is not None:
+            anchors["relative_base_upside_pct"] = upside
+    if dcf_valuation.get("available") and dcf_valuation.get("decision_usable", False):
+        upside = _numeric(dcf_valuation.get("scenarios", {}).get("base", {}).get("upside_pct"))
+        if upside is not None:
+            anchors["dcf_base_upside_pct"] = upside
+
+    cautions: list[str] = []
+    if anchors and max(anchors.values()) <= -20.0:
+        out["hard_limits"].append("reliable_valuation_downside_below_20pct")
+    if len(anchors) >= 2 and max(anchors.values()) - min(anchors.values()) >= 50.0:
+        cautions.append("valuation_methods_disagree_by_50pct")
+        out["confidence"] = "LOW"
+
+    out["hard_limits"] = list(dict.fromkeys(out["hard_limits"]))
+    if out["hard_limits"]:
+        out["posture"] = "REJECT-RISK WATCH"
+    out["position_band"] = position_band(
+        out["posture"], out["confidence"], out["hard_limits"], out["unavailable_components"]
+    )
+    if risk_profile == "保守" and out["position_band"] in {"4%-6%", "2%-4%"}:
+        out["position_band"] = "2%-4%" if out["position_band"] == "4%-6%" else "0%-2%"
+    out["valuation_constraints"] = {"usable_anchors": anchors, "cautions": cautions, "risk_profile": risk_profile}
+    return out
+
+
 def load_evidence(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {}
@@ -161,6 +200,9 @@ def write_bundle(
     as_of: date,
     horizon: str,
     language: str,
+    risk_profile: str = "平衡",
+    investment_style: str = "未指定",
+    research_depth: str = "标准尽调",
 ) -> dict[str, Any]:
     date_dir = output_root / as_of.strftime("%Y%m%d")
     display_ticker = enrich_ticker_name(ticker, evidence)
@@ -178,6 +220,9 @@ def write_bundle(
         "as_of": as_of.isoformat(),
         "horizon": horizon,
         "language": language,
+        "risk_profile": risk_profile,
+        "investment_style": investment_style,
+        "research_depth": research_depth,
         "evidence": evidence,
         "warnings": warnings,
         "sources": evidence.get("sources", []) if isinstance(evidence.get("sources", []), list) else [],
@@ -185,6 +230,7 @@ def write_bundle(
     research_score = score_research(evidence)
     fair_value = derive_fair_value(evidence, as_of, horizon)
     dcf_valuation = derive_dcf_valuation(evidence, horizon)
+    research_score = apply_valuation_constraints(research_score, fair_value, dcf_valuation, risk_profile)
     research_context = derive_research_context(evidence, research_score, fair_value, dcf_valuation)
     derived = {
         "ticker": display_ticker,
@@ -201,7 +247,8 @@ def write_bundle(
             "Scores are deterministic weighted component scores.",
             "Unavailable evidence is listed explicitly and does not receive neutral credit.",
             "DCF is a deterministic FCFF scenario model and fails closed when annual cash-flow or capital-structure evidence is insufficient.",
-            "DCF is reported as an independent valuation constraint and does not silently rewrite the local model score.",
+            "Reliable relative valuation and decision-usable DCF outputs constrain posture and shadow position sizing.",
+            "Risk profile adjusts the shadow position ceiling; style and depth are retained as auditable request context.",
             "Position bands are shadow-only research sizing guidance, not production portfolio changes.",
         ],
     }
@@ -209,7 +256,15 @@ def write_bundle(
     (stock_dir / "research_raw.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     (stock_dir / "research_derived.json").write_text(json.dumps(derived, ensure_ascii=False, indent=2), encoding="utf-8")
     (stock_dir / "research_brief.md").write_text(render_brief(raw, derived), encoding="utf-8")
-    return {"code": ticker["code"], "output_dir": str(stock_dir), "research_score": research_score}
+    return {
+        "code": ticker["code"],
+        "output_dir": str(stock_dir),
+        "research_score": research_score,
+        "industry": _evidence_industry(evidence),
+        "current_price": fair_value.get("current_price") or dcf_valuation.get("current_price"),
+        "fair_value_base": fair_value.get("scenarios", {}).get("base", {}).get("value") if fair_value.get("available") else None,
+        "dcf_value_base": dcf_valuation.get("scenarios", {}).get("base", {}).get("value") if dcf_valuation.get("available") and dcf_valuation.get("decision_usable") else None,
+    }
 
 
 def render_brief(raw: dict[str, Any], derived: dict[str, Any]) -> str:
@@ -270,7 +325,7 @@ def render_brief(raw: dict[str, Any], derived: dict[str, Any]) -> str:
                 f"- 保守{value_label}：{scenarios['bear']['value']:.2f} {currency}，较现价 {scenarios['bear']['upside_pct']:+.1f}%",
                 f"- 基准{value_label}：{scenarios['base']['value']:.2f} {currency}，较现价 {scenarios['base']['upside_pct']:+.1f}%",
                 f"- 乐观{value_label}：{scenarios['bull']['value']:.2f} {currency}，较现价 {scenarios['bull']['upside_pct']:+.1f}%",
-                f"- 基准假设：未来5年收入增速 {scenarios['base']['revenue_growth_pct']:.2f}%，FCFF利润率 {scenarios['base']['fcff_margin_pct']:.2f}%，WACC {scenarios['base']['wacc_pct']:.2f}%，永续增长率 {scenarios['base']['terminal_growth_pct']:.2f}%",
+                f"- 基准假设：未来{dcf.get('forecast_years', 5)}年收入增速 {scenarios['base']['revenue_growth_pct']:.2f}%，FCFF利润率 {scenarios['base']['fcff_margin_pct']:.2f}%，WACC {scenarios['base']['wacc_pct']:.2f}%，永续增长率 {scenarios['base']['terminal_growth_pct']:.2f}%",
                 f"- 现金流口径：历史 {len(dcf['historical_inputs']['years'])} 个年度，归一化 FCFF 利润率 {dcf['historical_inputs']['normalized_fcff_margin_pct']:.2f}%，模型置信度 {dcf['confidence']}",
                 f"- 净债务调整：{dcf['capital_structure']['net_debt_per_share']:.2f} {currency}/股（负数表示净现金）",
             ]
@@ -279,7 +334,7 @@ def render_brief(raw: dict[str, Any], derived: dict[str, Any]) -> str:
             lines.append("- 适用性提示：历史 FCFF 波动过大，本组数值仅作为低置信度现金流底值，不作为主要目标价；优先参考相对估值及未来盈利预测。")
         implied = dcf.get("implied_revenue_growth", {})
         if implied.get("available"):
-            lines.append(f"- 当前价格隐含增速：未来5年收入年均增长 {implied['annual_revenue_growth_pct']:.2f}%")
+            lines.append(f"- 当前价格隐含增速：未来{dcf.get('forecast_years', 5)}年收入年均增长 {implied['annual_revenue_growth_pct']:.2f}%")
         else:
             lines.append(f"- 当前价格隐含增速：超出模型搜索区间 -20% 至 50%（{implied.get('status', 'Unavailable')}）")
         lines.extend(["", "### WACC / 永续增长率敏感性（每股价值）", "", "| WACC \\ 永续增长率 | " + " | ".join(f"{value:.2f}%" for value in dcf["sensitivity"]["terminal_growth_columns_pct"]) + " |", "|---:" + "|---:" * len(dcf["sensitivity"]["terminal_growth_columns_pct"]) + "|"])
@@ -298,12 +353,13 @@ def render_brief(raw: dict[str, Any], derived: dict[str, Any]) -> str:
             "## 评分拆解",
         ]
     )
-    dcf_base_upside = _numeric(dcf.get("scenarios", {}).get("base", {}).get("upside_pct")) if dcf.get("available") else None
-    if dcf_base_upside is not None and dcf_base_upside < 0:
+    constraints = score.get("valuation_constraints", {})
+    anchors = constraints.get("usable_anchors", {}) if isinstance(constraints, dict) else {}
+    if anchors:
         score_heading = lines.index("## 评分拆解")
-        dcf_constraint_label = "DCF 基准目标价" if dcf.get("decision_usable", True) else "DCF 基准现金流底值"
+        anchor_text = "，".join(f"{name} {value:+.1f}%" for name, value in anchors.items())
         lines[score_heading:score_heading] = [
-            f"- 估值约束：{dcf_constraint_label}较现价 {dcf_base_upside:+.1f}%；该冲突未机械改写模型评分，实际仓位需单独下调或等待假设被验证。",
+            f"- 已生效估值约束：{anchor_text}",
             "",
         ]
     for name, value in score["component_scores"].items():
@@ -681,7 +737,7 @@ def write_multi_stock_outputs(results: list[dict[str, Any]], output_root: Path, 
         return
     date_dir = output_root / as_of.strftime("%Y%m%d")
     summary_path = date_dir / "deep_research_summary.csv"
-    fields = ["code", "research_posture", "confidence", "score", "position_band", "output_dir"]
+    fields = ["code", "industry", "research_posture", "confidence", "score", "position_band", "output_dir"]
     with summary_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -690,6 +746,7 @@ def write_multi_stock_outputs(results: list[dict[str, Any]], output_root: Path, 
             writer.writerow(
                 {
                     "code": item["code"],
+                    "industry": item.get("industry") or "unknown",
                     "research_posture": score["posture"],
                     "confidence": score["confidence"],
                     "score": score["total_score"],
@@ -697,14 +754,61 @@ def write_multi_stock_outputs(results: list[dict[str, Any]], output_root: Path, 
                     "output_dir": item["output_dir"],
                 }
             )
+    industry_counts: dict[str, int] = {}
+    for item in results:
+        industry = str(item.get("industry") or "unknown")
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+    top_industry, top_count = max(industry_counts.items(), key=lambda pair: pair[1])
+    concentration = top_count / len(results) * 100.0
     synthesis = [
         "# Portfolio Synthesis",
         "",
-        "This deterministic collector only summarizes per-stock research scores.",
-        "Use the final deep-research reports to compare industry concentration, catalyst clustering, and correlated risks.",
+        f"- 股票数量：{len(results)}",
+        f"- 最大行业集中度：{top_industry} {top_count}/{len(results)}（{concentration:.1f}%）",
+        "- 行业分布：" + "，".join(f"{name} {count}" for name, count in sorted(industry_counts.items())),
+        "- 相关性：当前证据包未提供统一日期对齐的全量收益序列，未虚构相关系数；组合建仓前仍需补做相关性与压力测试。",
         "",
     ]
     (date_dir / "portfolio_synthesis.md").write_text("\n".join(synthesis), encoding="utf-8")
+
+
+def append_research_ledger(results: list[dict[str, Any]], output_root: Path, as_of: date) -> None:
+    """Keep an idempotent decision snapshot for later forward-return review."""
+    path = output_root / "research_history.csv"
+    fields = [
+        "as_of", "code", "industry", "posture", "confidence", "score", "position_band",
+        "current_price", "fair_value_base", "dcf_value_base", "output_dir",
+    ]
+    existing: list[dict[str, Any]] = []
+    if path.exists():
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            existing = list(csv.DictReader(handle))
+    keyed = {(row.get("as_of"), row.get("code")): row for row in existing}
+    for item in results:
+        score = item["research_score"]
+        row = {
+            "as_of": as_of.isoformat(), "code": item["code"], "industry": item.get("industry") or "unknown",
+            "posture": score["posture"], "confidence": score["confidence"], "score": score["total_score"],
+            "position_band": score["position_band"], "current_price": item.get("current_price"),
+            "fair_value_base": item.get("fair_value_base"), "dcf_value_base": item.get("dcf_value_base"),
+            "output_dir": item["output_dir"],
+        }
+        keyed[(row["as_of"], row["code"])] = row
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(sorted(keyed.values(), key=lambda row: (str(row.get("as_of")), str(row.get("code")))))
+
+
+def _evidence_industry(evidence: dict[str, Any]) -> str:
+    for section_name in ("model", "catalyst"):
+        section = evidence.get(section_name)
+        rows = section.get("rows", []) if isinstance(section, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict) and row.get("industry"):
+                return str(row["industry"])
+    return str(evidence.get("industry") or "unknown")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -714,6 +818,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--as-of", default=date.today().isoformat(), help="Research cutoff date, YYYY-MM-DD.")
     parser.add_argument("--horizon", default="MEDIUM", choices=["SHORT", "MEDIUM", "LONG"])
     parser.add_argument("--language", default="zh-CN", choices=["zh-CN", "en"])
+    parser.add_argument("--risk-profile", default="平衡", choices=["保守", "平衡", "激进"])
+    parser.add_argument("--investment-style", default="未指定")
+    parser.add_argument("--research-depth", default="标准尽调")
     parser.add_argument("--evidence-json", type=Path, help="Optional JSON evidence map keyed by normalized code.")
     parser.add_argument("--model-output", type=Path, help="Reserved for saved model output ingestion.")
     return parser.parse_args(argv)
@@ -730,9 +837,22 @@ def main(argv: list[str] | None = None) -> int:
         evidence = select_evidence(all_evidence, ticker)
         if args.model_output:
             evidence = merge_model_output(evidence, args.model_output, ticker)
-        results.append(write_bundle(ticker, evidence, args.output_root, as_of, args.horizon, args.language))
+        results.append(
+            write_bundle(
+                ticker,
+                evidence,
+                args.output_root,
+                as_of,
+                args.horizon,
+                args.language,
+                args.risk_profile,
+                args.investment_style,
+                args.research_depth,
+            )
+        )
 
     write_multi_stock_outputs(results, args.output_root, as_of)
+    append_research_ledger(results, args.output_root, as_of)
     for item in results:
         score = item["research_score"]
         print(f"{item['code']}: {score['posture']} score={score['total_score']} position={score['position_band']}")

@@ -17,14 +17,13 @@ def build_quality_base(client: FutuClient, config: SelectionConfig) -> tuple[pd.
 
     scored = raw.copy()
     _ensure_identity_columns(scored)
+    _ensure_quality_scores(scored, trust_input_scores=config.trust_input_scores)
     _ensure_numeric(scored, ["latest_price", "pe_dynamic", "pb", "turnover_amount", "float_market_cap", "pct_change_20d"])
-    _ensure_quality_scores(scored)
     _ensure_risk_flags(scored)
 
     rejected_parts: list[pd.DataFrame] = []
-    risk_mask = scored["risk_flags"].astype(str).apply(
-        lambda value: any(keyword and keyword in value for keyword in config.risk_keywords)
-    )
+    risk_text = (scored["name"].fillna("").astype(str) + " " + scored["risk_flags"].astype(str)).str.upper()
+    risk_mask = risk_text.apply(lambda value: any(keyword.upper() in value for keyword in config.risk_keywords if keyword))
     if risk_mask.any():
         rejected = scored[risk_mask].copy()
         rejected["reject_reason"] = "risk_flag"
@@ -51,7 +50,12 @@ def build_quality_base(client: FutuClient, config: SelectionConfig) -> tuple[pd.
     scored["bucket"] = scored["quality_total_score"].map(lambda value: "core" if value >= 65 else "satellite")
 
     rejected_df = pd.concat(rejected_parts, ignore_index=True) if rejected_parts else pd.DataFrame()
-    return scored, rejected_df, {"initial_candidates": len(raw)}
+    metadata = {
+        "initial_candidates": len(raw),
+        "universe_source": str(raw.get("data_source", pd.Series(["unknown"])).iloc[0]),
+        "average_feature_coverage": round(float(scored.get("feature_coverage", pd.Series([0.0])).mean()), 1) if not scored.empty else 0.0,
+    }
+    return scored, rejected_df, metadata
 
 
 def recompute_quality_total(
@@ -155,7 +159,7 @@ def enrich_events(client: FutuClient, scored: pd.DataFrame, *, count: int, rank_
     return out
 
 
-def derive_industry_strength(scored: pd.DataFrame) -> pd.DataFrame:
+def derive_industry_strength(scored: pd.DataFrame, *, minimum_members: int = 3, neutral_score: float = 50.0) -> pd.DataFrame:
     if scored.empty or "industry" not in scored:
         return pd.DataFrame(columns=["industry", "industry_strength_score", "industry_net_flow", "industry_pct_change"])
     work = scored.copy()
@@ -168,9 +172,16 @@ def derive_industry_strength(scored: pd.DataFrame) -> pd.DataFrame:
         industry_pct_change=("pct_change_20d", "mean"),
         _flow=("capital_flow_score", "mean"),
         _momentum=("price_volume_score", "mean"),
+        industry_member_count=("code", "count"),
     )
-    grouped["industry_strength_score"] = (grouped["_flow"] * 0.55 + grouped["_momentum"] * 0.45).clip(0, 100).round(2)
-    return grouped.reset_index()[["industry", "industry_strength_score", "industry_net_flow", "industry_pct_change"]]
+    raw_score = (grouped["_flow"] * 0.55 + grouped["_momentum"] * 0.45).clip(0, 100)
+    grouped["industry_coverage_ratio"] = (grouped["industry_member_count"] / max(1, minimum_members)).clip(0, 1)
+    grouped["industry_strength_score"] = (
+        neutral_score + (raw_score - neutral_score) * grouped["industry_coverage_ratio"]
+    ).clip(0, 100).round(2)
+    return grouped.reset_index()[
+        ["industry", "industry_strength_score", "industry_member_count", "industry_coverage_ratio", "industry_net_flow", "industry_pct_change"]
+    ]
 
 
 def add_rotation_overlay(scored: pd.DataFrame) -> pd.DataFrame:
@@ -232,20 +243,42 @@ def _ensure_numeric(df: pd.DataFrame, columns: list[str]) -> None:
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
 
-def _ensure_quality_scores(df: pd.DataFrame) -> None:
-    if "fundamental_quality_score" not in df:
-        roe = _numeric_column(df, "roe")
-        df["fundamental_quality_score"] = (50 + roe * 2).clip(0, 100)
-    if "growth_quality_score" not in df:
-        growth_column = "revenue_growth" if "revenue_growth" in df else "pct_change_20d"
-        growth = _numeric_column(df, growth_column)
-        df["growth_quality_score"] = (50 + growth).clip(0, 100)
-    if "valuation_score" not in df:
+def _ensure_quality_scores(df: pd.DataFrame, *, trust_input_scores: bool = False) -> None:
+    raw_feature_columns = ["roe", "revenue_growth", "pe_dynamic", "pb", "pct_change_20d", "turnover_amount"]
+    available = pd.DataFrame(index=df.index)
+    for column in raw_feature_columns:
+        source = df[column] if column in df else pd.Series(pd.NA, index=df.index)
+        available[column] = pd.to_numeric(source, errors="coerce").notna()
+    df["feature_coverage"] = (available.mean(axis=1) * 100).round(1)
+
+    if not trust_input_scores:
+        roe = pd.to_numeric(df.get("roe", pd.Series(pd.NA, index=df.index)), errors="coerce")
+        cash_cover = pd.to_numeric(df.get("net_profit_cash_cover", pd.Series(pd.NA, index=df.index)), errors="coerce")
+        debt = pd.to_numeric(df.get("debt_to_assets", pd.Series(pd.NA, index=df.index)), errors="coerce")
+        df["fundamental_quality_score"] = (
+            35.0 + roe.fillna(0.0) * 1.5 + cash_cover.fillna(0.0).clip(-100, 200) * 0.08 - debt.fillna(50.0) * 0.10
+        ).clip(0, 100)
+        revenue_growth = pd.to_numeric(df.get("revenue_growth", pd.Series(pd.NA, index=df.index)), errors="coerce")
+        momentum_proxy = pd.to_numeric(df.get("pct_change_20d", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0)
+        df["growth_quality_score"] = (50 + revenue_growth).where(revenue_growth.notna(), 35 + momentum_proxy * 0.5).clip(0, 100)
         df["valuation_score"] = (100 - _valuation_percentile(df)).clip(0, 100)
-    if "price_volume_score" not in df:
-        change = pd.to_numeric(df.get("pct_change_20d", 0.0), errors="coerce").fillna(0.0)
-        turnover = pd.to_numeric(df.get("turnover_amount", 0.0), errors="coerce").fillna(0.0)
-        df["price_volume_score"] = (50 + change + turnover.rank(pct=True) * 25).clip(0, 100)
+        change = momentum_proxy
+        turnover = pd.to_numeric(df.get("turnover_amount", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0)
+        df["price_volume_score"] = (40 + change + turnover.rank(pct=True) * 30).clip(0, 100)
+        df["score_input_mode"] = available.apply(
+            lambda row: "raw_features" if bool(row.all()) else "partial_raw_proxy",
+            axis=1,
+        )
+    else:
+        df["score_input_mode"] = "trusted_input_scores"
+        if "fundamental_quality_score" not in df:
+            df["fundamental_quality_score"] = 0.0
+        if "growth_quality_score" not in df:
+            df["growth_quality_score"] = 0.0
+        if "valuation_score" not in df:
+            df["valuation_score"] = (100 - _valuation_percentile(df)).clip(0, 100)
+        if "price_volume_score" not in df:
+            df["price_volume_score"] = 0.0
     for column in ["fundamental_quality_score", "growth_quality_score", "valuation_score", "price_volume_score"]:
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0).clip(0, 100)
 
@@ -263,6 +296,8 @@ def _numeric_column(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.S
 
 
 def _valuation_percentile(df: pd.DataFrame) -> pd.Series:
+    if len(df) < 5:
+        return pd.Series(50.0, index=df.index, dtype="float64")
     pe = _numeric_column(df, "pe_dynamic").where(lambda values: values > 0, pd.NA)
     pb = _numeric_column(df, "pb").where(lambda values: values > 0, pd.NA)
     combined = pe.rank(pct=True).fillna(0.5) * 0.65 + pb.rank(pct=True).fillna(0.5) * 0.35

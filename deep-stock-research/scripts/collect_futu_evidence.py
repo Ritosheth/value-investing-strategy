@@ -71,21 +71,31 @@ def run_json(command: list[str], warnings: list[str], label: str) -> Any:
         return {}
     if not stdout:
         return {}
+    parsed = parse_json_output(stdout)
+    if parsed is not None:
+        return parsed
+    else:
+        warnings.append(f"{label} returned non-JSON output")
+        return {}
+
+
+def parse_json_output(stdout: str) -> Any:
+    """Extract one JSON value even when SDK logs surround a multi-line body."""
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        # Futu's SDK logger may write connection messages to stdout around the
-        # JSON payload. Prefer a complete JSON line and ignore those messages.
-        for line in reversed(stdout.splitlines()):
-            candidate = line.strip()
-            if not candidate.startswith(("{", "[")):
-                continue
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-        warnings.append(f"{label} returned non-JSON output")
-        return {}
+        pass
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(stdout):
+        if character not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(stdout[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return None
 
 
 def futu_json(script_name: str, futu_code: str, warnings: list[str], *args: str) -> Any:
@@ -119,12 +129,17 @@ def direct_daily_flow(futu_code: str, warnings: list[str]) -> Any:
         return {}
 
 
-def model_evidence(warnings: list[str]) -> dict[str, list[dict[str, Any]]]:
+def model_evidence(warnings: list[str], codes: list[str]) -> dict[str, list[dict[str, Any]]]:
     if not RUNTIME.exists():
         warnings.append(f"Project runtime missing: {RUNTIME}")
         return {}
     result = run_json(
-        [str(RUNTIME), "-m", MODEL_MODULE, "--model", "all", "--max-watchlist", "50", "--format", "json", "--refresh-quotes"],
+        [
+            str(RUNTIME), "-m", MODEL_MODULE, "--model", "all",
+            "--max-watchlist", str(max(20, len(codes))), "--format", "json",
+            "--refresh-quotes", "--codes", ",".join(codes),
+            "--min-turnover", "0", "--min-float-market-cap", "0",
+        ],
         warnings,
         "local model output",
     )
@@ -171,6 +186,68 @@ def compact_model_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{key: row[key] for key in keep if key in row} for row in rows]
 
 
+def derive_financial_quality_score(financials: Any, model_rows: list[dict[str, Any]]) -> tuple[float | None, str, dict[str, float]]:
+    data = financials.get("data", financials) if isinstance(financials, dict) else {}
+    reports = data.get("report_list", []) if isinstance(data, dict) else []
+    reports = [report for report in reports if isinstance(report, dict)]
+    if reports:
+        latest = max(reports, key=lambda report: str(report.get("date_time_str") or report.get("period_text") or ""))
+        metrics: dict[str, float] = {}
+        for item in latest.get("item_list", []) if isinstance(latest.get("item_list"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            field_id = item.get("field_id")
+            value = numeric(item, "data")
+            yoy = numeric(item, "yoy")
+            if value is None:
+                continue
+            if field_id in {3015, 3016}:
+                metrics.setdefault("roe", value)
+            elif field_id == 3019:
+                metrics["net_margin"] = value
+                if yoy is not None:
+                    metrics["net_margin_yoy"] = yoy
+            elif field_id == 3048:
+                metrics["revenue_cagr_3y"] = value
+            elif field_id == 3049:
+                metrics["profit_cagr_3y"] = value
+            elif field_id == 3054:
+                metrics["profit_cash_content"] = value
+                if yoy is not None:
+                    metrics["profit_cash_content_yoy"] = yoy
+            elif field_id == 3064:
+                metrics["debt_to_assets"] = value
+
+        parts: list[tuple[float, float]] = []
+        if "roe" in metrics:
+            parts.append((clamp(50 + (metrics["roe"] - 10) * 2), 0.25))
+        if "net_margin" in metrics:
+            parts.append((clamp(50 + (metrics["net_margin"] - 10) * 1.5 + metrics.get("net_margin_yoy", 0) * 0.25), 0.20))
+        if "profit_cash_content" in metrics:
+            parts.append((clamp(metrics["profit_cash_content"] * 0.5 + metrics.get("profit_cash_content_yoy", 0) * 0.20), 0.20))
+        growth_values = [metrics[key] for key in ("revenue_cagr_3y", "profit_cagr_3y") if key in metrics]
+        if growth_values:
+            parts.append((clamp(50 + sum(growth_values) / len(growth_values) * 1.5), 0.25))
+        if "debt_to_assets" in metrics:
+            parts.append((clamp(100 - metrics["debt_to_assets"]), 0.10))
+        if parts:
+            weight = sum(item[1] for item in parts)
+            score = sum(value * item_weight for value, item_weight in parts) / weight
+            return clamp(score), "富途最新财务指标：ROE、净利率、现金含量、3年增长及资产负债率", metrics
+
+    fallback = average([numeric(row, "fundamental_quality_score") for row in model_rows])
+    return fallback, "本地模型基本面分（财务报表指标不足时降级）", {}
+
+
+def derive_valuation_score(valuation: Any, model_rows: list[dict[str, Any]]) -> tuple[float | None, str]:
+    data = valuation.get("data", valuation) if isinstance(valuation, dict) else {}
+    trend = data.get("trend", {}) if isinstance(data, dict) else {}
+    percentile = numeric(trend, "valuation_percentile") if isinstance(trend, dict) else None
+    if percentile is not None and 0 <= percentile <= 100:
+        return clamp(100 - percentile), "富途当前历史估值分位的反向得分"
+    return average([numeric(row, "valuation_score") for row in model_rows]), "本地模型横截面估值分（历史分位不可用时降级）"
+
+
 def profile_has_data(profile: Any) -> bool:
     if isinstance(profile, dict):
         data = profile.get("data")
@@ -178,7 +255,7 @@ def profile_has_data(profile: Any) -> bool:
     return False
 
 
-def derive_governance_score(profile: Any, executives: Any, buybacks: Any) -> tuple[float | None, str]:
+def derive_governance_score(profile: Any, executives: Any, buybacks: Any, rows: list[dict[str, Any]]) -> tuple[float | None, str]:
     profile_ok = profile_has_data(profile)
     executives_ok = isinstance(executives, dict) and bool(executives.get("data"))
     buyback_data = buybacks.get("data") if isinstance(buybacks, dict) else None
@@ -189,8 +266,30 @@ def derive_governance_score(profile: Any, executives: Any, buybacks: Any) -> tup
     # that the company's governance quality has been proven.
     # Cap this proxy below a clean bill of health: availability of records is
     # not the same thing as verified governance quality.
-    score = 45.0 + (10.0 if profile_ok else 0.0) + (10.0 if executives_ok else 0.0) + (10.0 if buyback_ok else 0.0)
-    return clamp(score), "基于公司概况/高管/回购数据可用性的确定性筛查分；需结合公告人工复核"
+    governance_risk_hit = any(
+        str(row.get("name") or "").upper().startswith(("*ST", "ST"))
+        or "退" in str(row.get("name") or "")
+        or any(keyword in str(row.get("risk_flags") or "").upper() for keyword in ("*ST", "ST", "退"))
+        for row in rows
+    )
+    if governance_risk_hit:
+        return 0.0, "名称或模型风险字段触发 ST/退市硬风险；需以交易所公告复核"
+    score = 45.0 + (5.0 if profile_ok else 0.0) + (5.0 if executives_ok else 0.0) + (5.0 if buyback_ok else 0.0)
+    return clamp(score), "仅为治理证据覆盖度筛查分（上限60），不代表治理质量已获证实；需结合公告人工复核"
+
+
+def source_has_payload(value: Any) -> bool:
+    if value in (None, "", [], {}):
+        return False
+    if isinstance(value, dict):
+        if value.get("error") or value.get("isError"):
+            return False
+        if "data" in value:
+            return source_has_payload(value.get("data"))
+        return any(source_has_payload(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(source_has_payload(item) for item in value)
+    return True
 
 
 def collect_one(ticker: dict[str, str], model_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -224,16 +323,16 @@ def collect_one(ticker: dict[str, str], model_rows: list[dict[str, Any]]) -> dic
     buybacks = futu_json("get_corporate_actions_buybacks.py", futu_code, warnings, "--num", "20")
 
     model_score = average([numeric(row, "total_score") for row in rows])
-    financial_score = average([numeric(row, "fundamental_quality_score") for row in rows])
-    valuation_score = average([numeric(row, "valuation_score") for row in rows])
+    financial_score, financial_basis, financial_metrics = derive_financial_quality_score(financials, rows)
+    valuation_score, valuation_basis = derive_valuation_score(valuation, rows)
     catalyst_score = average([numeric(row, "catalyst_score") for row in rows])
     technical_score = average([
         average([numeric(row, "price_volume_score") for row in rows]),
         average([numeric(row, "capital_flow_score") for row in rows]),
     ])
-    governance_score, governance_basis = derive_governance_score(profile, executives, buybacks)
+    governance_score, governance_basis = derive_governance_score(profile, executives, buybacks, rows)
     source_values = [snapshot, financials, *annual_statements.values(), valuation, profile, executives, kline, flow, buybacks, rows]
-    successful_sources = sum(bool(value) for value in source_values)
+    successful_sources = sum(source_has_payload(value) for value in source_values)
     data_confidence = clamp(successful_sources / len(source_values) * 100.0)
 
     sources = [
@@ -247,17 +346,18 @@ def collect_one(ticker: dict[str, str], model_rows: list[dict[str, Any]]) -> dic
             ("valuation_detail", valuation),
             ("company_profile", profile), ("company_executives", executives), ("daily_kline", kline),
             ("capital_flow", flow), ("buybacks", buybacks), ("local_model_output", rows),
-        ] if value
+        ] if source_has_payload(value)
     ]
     evidence: dict[str, Any] = {
         "model": {"score": model_score, "rows": compact_model_rows(rows)} if model_score is not None else None,
         "financial_quality": {
             "score": financial_score,
-            "source": "local model fundamental_quality_score",
+            "source": financial_basis,
+            "derived_metrics": financial_metrics,
             "financials": financials,
             "annual_statements": annual_statements,
         } if financials or any(annual_statements.values()) else None,
-        "valuation": {"score": valuation_score, "source": "local model valuation_score", "valuation_detail": valuation} if valuation else None,
+        "valuation": {"score": valuation_score, "source": valuation_basis, "valuation_detail": valuation} if valuation else None,
         "catalyst": {"score": catalyst_score, "source": "local model catalyst_score", "rows": compact_model_rows(rows)} if catalyst_score is not None else None,
         "technical_flow": {"score": technical_score, "source": "local model price/flow scores", "kline": kline, "capital_flow": flow} if technical_score is not None else None,
         "governance_risk": {"score": governance_score, "basis": governance_basis, "profile": profile, "executives": executives, "buybacks": buybacks} if governance_score is not None else None,
@@ -277,10 +377,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="Evidence JSON output path")
     args = parser.parse_args()
     warnings: list[str] = []
-    model_map = model_evidence(warnings)
+    normalized = [normalize_ticker(code) for code in args.codes]
+    model_map = model_evidence(warnings, [ticker["futu_code"] for ticker in normalized])
     output: dict[str, Any] = {}
-    for raw_code in args.codes:
-        ticker = normalize_ticker(raw_code)
+    for ticker in normalized:
         rows = model_map.get(ticker["code"].split(".")[0], [])
         output[ticker["code"]] = collect_one(ticker, rows)
     if warnings:

@@ -26,13 +26,30 @@ def main() -> int:
     parser.add_argument("--data-csv", help="Candidate universe CSV. Defaults to langchao_candidates.csv.")
     parser.add_argument("--sample-data", action="store_true", help="Use the built-in demo data instead of the project candidate CSV.")
     parser.add_argument("--max-watchlist", type=int, default=20)
+    parser.add_argument("--max-market-candidates", type=int, default=120)
+    parser.add_argument("--min-turnover", type=float, default=50_000_000.0)
+    parser.add_argument("--min-float-market-cap", type=float, default=3_000_000_000.0)
+    parser.add_argument("--min-listed-days", type=int, default=120)
+    parser.add_argument("--live-universe", action="store_true", help="Use Futu V2 CN full-market stock screen; fall back to CSV seeds on failure.")
+    parser.add_argument("--codes", help="Comma-separated explicit tickers; scores these names even when they are outside the saved universe.")
     parser.add_argument("--format", choices=["json", "markdown", "csv"], default="markdown")
     parser.add_argument("--refresh-quotes", action="store_true", help="Refresh quote fields from Futu OpenD before scoring.")
     args = parser.parse_args()
 
-    config = SelectionConfig(max_watchlist=args.max_watchlist)
+    seed_codes = tuple(_normalize_futu_code(value) for value in (args.codes or "").split(",") if value.strip())
+    config = SelectionConfig(
+        max_watchlist=args.max_watchlist,
+        max_market_candidates=args.max_market_candidates,
+        min_turnover_amount=args.min_turnover,
+        min_float_market_cap=args.min_float_market_cap,
+        min_listed_days=args.min_listed_days,
+        live_market_screen=args.live_universe,
+        seed_codes=seed_codes,
+    )
     default_csv = Path(__file__).with_name("langchao_candidates.csv")
-    if args.sample_data:
+    if seed_codes:
+        client = FutuClient()
+    elif args.sample_data:
         client = FutuClient.from_sample()
     elif args.data_csv:
         client = FutuClient.from_csv(args.data_csv)
@@ -41,7 +58,7 @@ def main() -> int:
     else:
         client = FutuClient.from_sample()
         client.warn(f"Default candidate CSV not found: {default_csv}; using built-in sample data.")
-    if args.refresh_quotes:
+    if args.refresh_quotes and not args.live_universe:
         with redirect_stdout(sys.stderr):
             client.refresh_market_snapshot()
     selected = MODELS.values() if args.model == "all" else [MODELS[args.model]]
@@ -67,6 +84,20 @@ def main() -> int:
                     print(f"- {warning}")
     client.close()
     return 0
+
+
+def _normalize_futu_code(value: str) -> str:
+    code = value.strip().upper()
+    if "." in code:
+        left, right = code.split(".", 1)
+        if left in {"SH", "SZ", "BJ", "HK", "US"}:
+            return code
+        if right in {"SH", "SZ", "BJ", "HK", "US"}:
+            return f"{right}.{left}"
+    if code.isdigit() and len(code) == 6:
+        market = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8")) else "SZ"
+        return f"{market}.{code}"
+    return f"US.{code.removesuffix('.US')}"
 
 
 def _format_table(df):
@@ -95,6 +126,8 @@ COLUMN_CN = {
     "price_volume_score": "量价分",
     "stock_quality_blend": "个股质量综合分",
     "industry_strength_score": "行业强度分",
+    "industry_member_count": "行业样本数",
+    "industry_coverage_ratio": "行业覆盖率",
     "industry_net_flow": "行业净流入",
     "industry_pct_change": "行业涨跌幅",
     "event_score": "事件分",
@@ -127,6 +160,8 @@ COLUMN_CN = {
     "float_market_cap": "流通市值",
     "risk_flags": "风险标记",
     "price_source": "行情来源",
+    "score_input_mode": "评分输入模式",
+    "feature_coverage": "原始特征覆盖率",
     "selection_reason": "选择理由",
 }
 
@@ -155,6 +190,7 @@ VALUE_CN = {
     "sample": "样例数据",
     "csv": "CSV文件",
     "live_futu_snapshot": "富途实时快照",
+    "live_futu_stock_screen": "富途全市场筛选",
 }
 
 

@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pandas as pd
 
 from stock_investment_system.config import SelectionConfig
-from stock_investment_system.futu_client import FutuClient
-from stock_investment_system.futu_models import build_quality_base, enrich_flow, enrich_valuation
+from stock_investment_system.futu_client import FutuClient, _normalize_stock_screen_items
+from stock_investment_system.futu_models import build_quality_base, derive_industry_strength, enrich_flow, enrich_valuation
 from stock_investment_system.models import event_flow_confirmation, industry_flow_quality, quality_growth
 from stock_investment_system.parameters import weighted_score
 from stock_investment_system.run_models import main
@@ -140,12 +140,51 @@ class RuntimeModuleTests(unittest.TestCase):
         )
         client = FutuClient(base_data=base)
 
-        scored, rejected, _ = build_quality_base(client, SelectionConfig(max_market_candidates=1))
+        scored, rejected, _ = build_quality_base(
+            client,
+            SelectionConfig(max_market_candidates=1, min_turnover_amount=0, min_float_market_cap=0),
+        )
 
         self.assertTrue(rejected.empty)
         self.assertEqual(len(scored), 1)
-        self.assertTrue((scored["fundamental_quality_score"] == 50).all())
-        self.assertTrue((scored["growth_quality_score"] == 52).all())
+        self.assertTrue((scored["fundamental_quality_score"] == 30).all())
+        self.assertTrue((scored["growth_quality_score"] == 36).all())
+        self.assertEqual(scored.iloc[0]["score_input_mode"], "partial_raw_proxy")
+
+    def test_saved_score_columns_are_recomputed_from_raw_features(self) -> None:
+        base = FutuClient.from_sample().base_data.head(1).copy()
+        base["fundamental_quality_score"] = 99.0
+        base["growth_quality_score"] = 99.0
+        base["roe"] = 10.0
+        base["revenue_growth"] = 5.0
+        client = FutuClient(base_data=base)
+
+        scored, _, _ = build_quality_base(client, SelectionConfig(max_market_candidates=1))
+
+        self.assertNotEqual(float(scored.iloc[0]["fundamental_quality_score"]), 99.0)
+        self.assertEqual(float(scored.iloc[0]["growth_quality_score"]), 55.0)
+
+    def test_stock_name_itself_triggers_st_risk_gate(self) -> None:
+        base = FutuClient.from_sample().base_data.head(1).copy()
+        base["name"] = "*ST测试"
+        base["risk_flags"] = ""
+
+        scored, rejected, _ = build_quality_base(FutuClient(base_data=base), SelectionConfig(max_market_candidates=1))
+
+        self.assertTrue(scored.empty)
+        self.assertEqual(rejected.iloc[0]["reject_reason"], "risk_flag")
+
+    def test_single_stock_industry_score_is_shrunk_toward_neutral(self) -> None:
+        data = pd.DataFrame([{
+            "code": "A", "industry": "单一样本行业", "capital_flow_score": 100,
+            "price_volume_score": 100, "flow_net_20d": 1, "pct_change_20d": 10,
+        }])
+
+        result = derive_industry_strength(data)
+
+        self.assertEqual(int(result.iloc[0]["industry_member_count"]), 1)
+        self.assertGreater(float(result.iloc[0]["industry_strength_score"]), 50)
+        self.assertLess(float(result.iloc[0]["industry_strength_score"]), 100)
 
     def test_csv_loader_preserves_leading_zero_security_codes(self) -> None:
         import tempfile
@@ -157,6 +196,37 @@ class RuntimeModuleTests(unittest.TestCase):
 
         self.assertEqual(str(loaded.iloc[0]["code"]), "000001")
         self.assertEqual(str(loaded.iloc[0]["futu_code"]), "SZ.000001")
+
+    def test_v2_stock_screen_nested_results_and_units_are_normalized(self) -> None:
+        items = [{"results": [
+            {"type": "basic", "property": {"name": 1101}, "sval": "000725"},
+            {"type": "basic", "property": {"name": 1102}, "sval": "京东方A"},
+            {"type": "cumulative", "property": {"name": 3105}, "dval": 355_000_000_000.0},
+            {"type": "cumulative", "property": {"name": 3102}, "dval": -0.10},
+            {"type": "financial", "property": {"name": 4903}, "ival": 195_000_000_000_000},
+            {"type": "financial", "property": {"name": 4110}, "dval": 0.12},
+        ]}]
+
+        frame = _normalize_stock_screen_items(items)
+
+        self.assertEqual(frame.iloc[0]["futu_code"], "SZ.000725")
+        self.assertEqual(float(frame.iloc[0]["turnover_amount"]), 3_550_000_000.0)
+        self.assertEqual(float(frame.iloc[0]["float_market_cap"]), 195_000_000_000.0)
+        self.assertEqual(float(frame.iloc[0]["pct_change_20d"]), -10.0)
+        self.assertEqual(float(frame.iloc[0]["roe"]), 12.0)
+
+    def test_live_market_universe_is_cached_across_models(self) -> None:
+        client = FutuClient.from_sample()
+        config = SelectionConfig(live_market_screen=True, max_market_candidates=2)
+        live = client.base_data.head(2).copy()
+        live["data_source"] = "live_futu_stock_screen"
+
+        with patch.object(client, "_stock_screen_candidates", return_value=live) as screen:
+            first = client.market_candidates(config)
+            second = client.market_candidates(config)
+
+        self.assertEqual(screen.call_count, 1)
+        self.assertEqual(first["code"].tolist(), second["code"].tolist())
 
     def test_valuation_enrichment_keeps_score_and_percentile_consistent(self) -> None:
         client = FutuClient.from_sample()
@@ -185,6 +255,7 @@ class RuntimeModuleTests(unittest.TestCase):
         script = Path("/Users/jun/Documents/BY股票投资/stock_investment_system/launcher/run_stock_system.sh").read_text()
 
         self.assertIn("--refresh-quotes", script)
+        self.assertIn("--live-universe", script)
         self.assertIn('cd "$PROJECT_DIR"', script)
 
     def test_csv_output_starts_with_header_when_refresh_prints_logs(self) -> None:
