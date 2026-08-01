@@ -1,0 +1,4 @@
+pandas
+numpy
+futu-api
+tomli; python_version < "3.11"

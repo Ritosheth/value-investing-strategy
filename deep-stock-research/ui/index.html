@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deep Stock Research · 本机研究台</title>
+  <style>
+    :root { --ink:#152238; --muted:#6b7890; --line:#dce3ec; --paper:#f8fafc; --card:#ffffff; --accent:#1769aa; --accent2:#0c8b7d; --warm:#f3b562; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif; background:linear-gradient(145deg,#eef5fb 0%,#f9fafb 55%,#fff6e9 100%); min-height:100vh; }
+    .shell { width:min(1180px, calc(100% - 40px)); margin:0 auto; padding:34px 0 54px; }
+    header { display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:28px; }
+    .eyebrow { color:var(--accent); text-transform:uppercase; letter-spacing:.14em; font-size:12px; font-weight:700; }
+    h1 { font-size:clamp(32px,5vw,58px); line-height:1.03; margin:10px 0 12px; letter-spacing:-.04em; }
+    .subtitle { color:var(--muted); max-width:630px; font-size:16px; line-height:1.7; margin:0; }
+    .badge { border:1px solid #c9d8e6; background:rgba(255,255,255,.72); border-radius:999px; padding:10px 14px; font-size:13px; white-space:nowrap; color:#49647c; }
+    .layout { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr); gap:20px; align-items:start; }
+    .card { background:rgba(255,255,255,.88); border:1px solid rgba(210,220,232,.9); border-radius:22px; box-shadow:0 18px 44px rgba(47,70,98,.08); padding:25px; }
+    .card h2 { margin:0 0 7px; font-size:19px; }
+    .hint { color:var(--muted); font-size:13px; line-height:1.6; margin:0 0 20px; }
+    label { display:block; font-weight:700; font-size:13px; margin:17px 0 8px; }
+    input, textarea, select { width:100%; border:1px solid var(--line); border-radius:12px; background:#fff; color:var(--ink); padding:12px 13px; font:inherit; outline:none; transition:border .2s,box-shadow .2s; }
+    input:focus, textarea:focus, select:focus { border-color:#7eafd3; box-shadow:0 0 0 4px rgba(23,105,170,.1); }
+    textarea { min-height:180px; resize:vertical; line-height:1.65; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip { border:1px solid var(--line); border-radius:999px; padding:8px 11px; color:#506078; background:#fff; cursor:pointer; font-size:13px; }
+    .chip.active { color:var(--accent); border-color:#8ab6d4; background:#edf7ff; }
+    .actions { display:flex; gap:10px; align-items:center; margin-top:22px; }
+    button { border:0; border-radius:12px; padding:13px 19px; font-weight:800; color:#fff; background:linear-gradient(135deg,var(--accent),#2454a0); cursor:pointer; box-shadow:0 8px 18px rgba(23,105,170,.22); }
+    button:disabled { opacity:.55; cursor:wait; }
+    .secondary { background:#eef3f7; color:#38516b; box-shadow:none; }
+    .status { color:var(--muted); font-size:13px; }
+    .side { display:grid; gap:20px; }
+    .steps { display:grid; gap:14px; margin-top:16px; }
+    .step { display:grid; grid-template-columns:32px 1fr; gap:11px; align-items:start; }
+    .num { width:30px; height:30px; display:grid; place-items:center; border-radius:10px; background:#e9f3fb; color:var(--accent); font-weight:800; }
+    .step strong { font-size:14px; display:block; margin:2px 0 4px; }
+    .step span { font-size:12px; color:var(--muted); line-height:1.55; }
+    .notice { border-left:4px solid var(--warm); background:#fff9ee; padding:13px 15px; border-radius:10px; font-size:12px; color:#6c593e; line-height:1.65; }
+    #result { display:none; margin-top:20px; }
+    .result-head { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    .state { font-size:12px; border-radius:999px; padding:7px 10px; background:#e9f7f3; color:#167767; }
+    .state.error { background:#fff0f0; color:#a43d3d; }
+    .result-body { margin-top:14px; background:#101d2d; color:#d8e5f1; padding:16px; border-radius:14px; white-space:pre-wrap; font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; max-height:260px; overflow:auto; }
+    .valuation { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-top:14px; }
+    .valuation-card { background:#f5f9fc; border:1px solid #dce8f0; border-radius:12px; padding:12px; }
+    .valuation-card strong { display:block; font-size:12px; color:#5f7287; margin-bottom:5px; }
+    .valuation-card b { font-size:22px; color:#153b59; }
+    .valuation-card span { display:block; margin-top:4px; color:#64778c; font-size:12px; }
+    .links { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+    .links a { color:var(--accent); font-size:13px; text-decoration:none; background:#eef7ff; border-radius:9px; padding:8px 10px; }
+    @media (max-width:800px) { .shell{width:min(100% - 24px,620px); padding-top:24px;} header{display:block;} .badge{display:inline-block;margin-top:18px;} .layout{grid-template-columns:1fr;} .grid2{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <div class="eyebrow">Local Research Desk · 01</div>
+        <h1>Deep Stock<br>Research</h1>
+        <p class="subtitle">把你的研究问题整理成可追溯的股票研究任务。本机读取 Futu/OpenD 与模型数据，自动生成证据包、评分简报、相对估值和 DCF 目标价。</p>
+      </div>
+      <div class="badge">● 仅本机运行 · 不自动下单</div>
+    </header>
+
+    <section class="layout">
+      <form class="card" id="research-form">
+        <h2>新建研究任务</h2>
+        <p class="hint">先填写代码，再用自然语言描述你想知道什么。多个代码用逗号分隔。</p>
+
+        <label for="codes">研究对象</label>
+        <input id="codes" name="codes" placeholder="例如：600519, 300750, 0700.HK, AAPL" required />
+
+        <label for="requirement">研究要求</label>
+        <textarea id="requirement" name="requirement" placeholder="例如：关注过去三年收入和现金流质量、竞争格局、估值水平、主要催化剂和可能证伪投资逻辑的风险。请区分事实、推导和待核实信息。" required></textarea>
+
+        <div class="grid2">
+          <div>
+            <label for="style">投资风格</label>
+            <select id="style"><option>价值</option><option>成长</option><option>困境反转</option><option>分红</option><option>技术/交易</option></select>
+          </div>
+          <div>
+            <label for="horizon">持有周期</label>
+            <select id="horizon"><option value="SHORT">短期（6个月内）</option><option value="MEDIUM" selected>中期（6-18个月）</option><option value="LONG">长期（1-3年以上）</option></select>
+          </div>
+          <div>
+            <label for="risk">风险偏好</label>
+            <select id="risk"><option>保守</option><option selected>平衡</option><option>激进</option></select>
+          </div>
+          <div>
+            <label for="depth">研究深度</label>
+            <select id="depth"><option>快速扫描</option><option selected>标准尽调</option><option>深度分析</option></select>
+          </div>
+        </div>
+
+        <label>常用研究重点</label>
+        <div class="chips" id="focuses">
+          <button type="button" class="chip" data-text="业务模式与竞争壁垒">业务与护城河</button>
+          <button type="button" class="chip" data-text="财务质量、现金流和资产负债表">财务质量</button>
+          <button type="button" class="chip" data-text="行业周期、竞争格局和政策变量">行业竞争</button>
+          <button type="button" class="chip" data-text="公司治理、股权结构和资本配置">治理结构</button>
+          <button type="button" class="chip" data-text="估值、同业比较和情景分析">估值</button>
+          <button type="button" class="chip" data-text="催化剂、风险和证伪条件">催化与风险</button>
+        </div>
+
+        <div class="actions">
+          <button id="run" type="submit">开始生成研究结果</button>
+          <button id="clear" class="secondary" type="button">清空</button>
+          <span class="status" id="status">结果将保存到 outputs/deep_research</span>
+        </div>
+      </form>
+
+      <aside class="side">
+        <div class="card">
+          <h2>运行流程</h2>
+          <p class="hint">提交后后台运行，不需要一直停留在页面。</p>
+          <div class="steps">
+            <div class="step"><div class="num">1</div><div><strong>保存研究要求</strong><span>记录代码、周期、风格和自然语言要求。</span></div></div>
+            <div class="step"><div class="num">2</div><div><strong>生成证据包</strong><span>运行本地采集器，显式列出缺失证据，不把缺失当中性。</span></div></div>
+            <div class="step"><div class="num">3</div><div><strong>查看结果</strong><span>查看 DCF 目标价、历史相对估值、敏感性分析和完整证据文件。</span></div></div>
+          </div>
+        </div>
+        <div class="notice">运行前请保持 Futu OpenD 已启动并登录。研究简报是可复现的证据底稿，不是自动买卖指令；官方披露和外部资料仍需进一步引用校验。</div>
+      </aside>
+    </section>
+
+    <section class="card" id="result">
+      <div class="result-head"><h2>运行结果</h2><span class="state" id="state">排队中</span></div>
+      <div class="result-body" id="result-body"></div>
+      <div class="valuation" id="valuation"></div>
+      <div class="links" id="links"></div>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById('research-form');
+    const run = document.getElementById('run');
+    const status = document.getElementById('status');
+    const result = document.getElementById('result');
+    const state = document.getElementById('state');
+    const body = document.getElementById('result-body');
+    const valuation = document.getElementById('valuation');
+    const links = document.getElementById('links');
+    let timer;
+    document.querySelectorAll('.chip').forEach(chip => chip.addEventListener('click', () => chip.classList.toggle('active')));
+    document.getElementById('clear').addEventListener('click', () => { form.reset(); document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')); result.style.display='none'; valuation.innerHTML=''; status.textContent='结果将保存到 outputs/deep_research'; });
+
+    function showState(text, isError=false) { state.textContent=text; state.className='state' + (isError ? ' error' : ''); }
+    function showLinks(job) {
+      links.innerHTML='';
+      if (job.evidence_file) {
+        const marker = job.evidence_file.indexOf('/outputs/deep_research/') + '/outputs/deep_research/'.length;
+        const rel = marker > 0 ? job.evidence_file.slice(marker) : '';
+        const a=document.createElement('a'); a.target='_blank'; a.textContent='证据总包 · evidence_bundle.json'; a.href='/api/file?path=' + encodeURIComponent(rel); links.appendChild(a);
+      }
+      (job.output_dirs || []).forEach(path => {
+        const marker = path.indexOf('/outputs/deep_research/') + '/outputs/deep_research/'.length;
+        const rel = marker > 0 ? path.slice(marker) : '';
+        [['研究简报','research_brief.md'],['原始证据','research_raw.json'],['派生评分','research_derived.json'],['研究请求','research_request.md']].forEach(([label,file]) => {
+          const a=document.createElement('a'); a.target='_blank'; a.textContent=label + ' · ' + rel.split('/').pop(); a.href='/api/file?path=' + encodeURIComponent(rel + '/' + file); links.appendChild(a);
+        });
+      });
+    }
+    async function showValuation(job) {
+      valuation.innerHTML='';
+      for (const path of (job.output_dirs || [])) {
+        const marker = path.indexOf('/outputs/deep_research/') + '/outputs/deep_research/'.length;
+        const rel = marker > 0 ? path.slice(marker) : '';
+        try {
+          const data = await fetch('/api/file?path=' + encodeURIComponent(rel + '/research_derived.json')).then(r => r.json());
+          const name = data.ticker?.name || rel.split('/').pop();
+          const dcf = data.dcf_valuation;
+          if (dcf && dcf.available) {
+            const card = document.createElement('div'); card.className='valuation-card';
+            const title = document.createElement('strong'); title.textContent=name + (dcf.decision_usable === false ? ' · DCF现金流底值' : ' · DCF目标价'); card.appendChild(title);
+            const value = document.createElement('b'); value.textContent=dcf.scenarios.base.value.toFixed(2) + ' ' + (dcf.currency || 'CNY'); card.appendChild(value);
+            const detail = document.createElement('span'); detail.textContent='保守 ' + dcf.scenarios.bear.value.toFixed(2) + ' · 乐观 ' + dcf.scenarios.bull.value.toFixed(2) + ' · 当前 ' + dcf.current_price.toFixed(2) + ' · ' + dcf.confidence; card.appendChild(detail);
+            valuation.appendChild(card);
+          }
+          const fair = data.fair_value;
+          if (fair && fair.available) {
+            const card = document.createElement('div'); card.className='valuation-card';
+            const title = document.createElement('strong'); title.textContent=name + ' · 历史相对估值'; card.appendChild(title);
+            const value = document.createElement('b'); value.textContent=fair.scenarios.base.value.toFixed(2); card.appendChild(value);
+            const detail = document.createElement('span'); detail.textContent='保守 ' + fair.scenarios.bear.value.toFixed(2) + ' · 乐观 ' + fair.scenarios.bull.value.toFixed(2) + ' · 当前 ' + fair.current_price.toFixed(2) + ' · ' + fair.multiple_name; card.appendChild(detail);
+            valuation.appendChild(card);
+          }
+        } catch (error) { /* The linked JSON remains available even if the card cannot load. */ }
+      }
+    }
+    async function poll(id) {
+      const data = await fetch('/api/status?id=' + encodeURIComponent(id)).then(r => r.json());
+      if (data.status === 'queued' || data.status === 'running') { showState(data.status === 'running' ? '运行中' : '排队中'); status.textContent='正在生成，请稍候…'; timer=setTimeout(() => poll(id), 900); return; }
+      run.disabled=false;
+      if (data.status === 'complete') { showState('已完成'); status.textContent='研究结果已生成'; body.textContent=(data.stdout || '任务完成') + (data.stderr ? '\n' + data.stderr : ''); showValuation(data); showLinks(data); }
+      else { showState('运行失败', true); status.textContent='请查看错误信息'; body.textContent=data.error || '未知错误'; }
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); clearTimeout(timer); run.disabled=true; result.style.display='block'; showState('排队中'); body.textContent=''; valuation.innerHTML=''; links.innerHTML='';
+      const focuses=[...document.querySelectorAll('.chip.active')].map(x=>x.dataset.text);
+      const requirement=document.getElementById('requirement').value + (focuses.length ? '\n\n重点关注：' + focuses.join('；') : '');
+      const payload={codes:document.getElementById('codes').value, requirement, style:document.getElementById('style').value, horizon:document.getElementById('horizon').value, risk:document.getElementById('risk').value, depth:document.getElementById('depth').value};
+      try { const response=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await response.json(); if(!response.ok) throw new Error(data.error); status.textContent='任务已提交'; poll(data.job_id); }
+      catch (error) { run.disabled=false; showState('提交失败',true); body.textContent=error.message; status.textContent='请检查输入'; }
+    });
+  </script>
+</body>
+</html>

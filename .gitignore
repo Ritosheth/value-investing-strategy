@@ -1,0 +1,31 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.log
+
+# Local Python/runtime state
+.venv/
+**/.venv/
+.home/
+**/.home/
+.pycache/
+**/.pycache/
+
+# Generated research/model artifacts
+outputs/
+**/outputs/
+
+# Downloaded installers, archives, and generated app bundles
+*.zip
+stock_investment_system/vendor/
+股票投资系统.app/
+
+# Local secrets
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example

@@ -1,0 +1,59 @@
+version = "rules_v1"
+description = "Initial rule-based parameter set matching the V1 hardcoded model weights."
+
+[model1_quality_growth.initial_quality_weights]
+fundamental_quality_score = 0.35
+growth_quality_score = 0.35
+valuation_score = 0.20
+price_volume_score = 0.10
+
+[model1_quality_growth.total_score_weights]
+fundamental_quality_score = 0.32
+growth_quality_score = 0.33
+valuation_score = 0.22
+price_volume_score = 0.10
+shareholder_return_score = 0.03
+
+[model2_industry_flow_quality.stock_quality_blend_weights]
+fundamental_quality_score = 0.45
+growth_quality_score = 0.35
+valuation_score = 0.20
+
+[model2_industry_flow_quality.pre_industry_score_weights]
+stock_quality_blend = 0.65
+price_volume_score = 0.35
+
+[model2_industry_flow_quality.total_score_weights]
+stock_quality_blend = 0.55
+industry_strength_score = 0.30
+capital_flow_score = 0.10
+price_volume_score = 0.05
+
+[model3_event_flow_confirmation.stock_quality_blend_weights]
+fundamental_quality_score = 0.45
+growth_quality_score = 0.35
+valuation_score = 0.20
+
+[model3_event_flow_confirmation.pre_event_score_weights]
+stock_quality_blend = 0.70
+price_volume_score = 0.30
+
+[model3_event_flow_confirmation.catalyst_score_weights]
+event_score = 0.45
+expectation_score = 0.40
+shareholder_return_score = 0.15
+
+[model3_event_flow_confirmation.pre_flow_rank_score_weights]
+catalyst_score = 0.50
+stock_quality_blend = 0.35
+price_volume_score = 0.15
+
+[model3_event_flow_confirmation.total_score_weights]
+catalyst_score = 0.35
+capital_flow_score = 0.30
+stock_quality_blend = 0.25
+price_volume_score = 0.10
+
+[model3_event_flow_confirmation.flow_confirmation_thresholds]
+flow_net_10d_min = 0.0
+flow_net_20d_min = 0.0

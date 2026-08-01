@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deep Stock Research"
+  short_description: "Chinese evidence-backed research for selected stocks"
+  default_prompt: "Use $deep-stock-research to collect evidence and produce a Chinese deep-research report for these stocks."
