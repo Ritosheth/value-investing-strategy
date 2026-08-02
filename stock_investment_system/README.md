@@ -53,6 +53,37 @@ Result files are saved under:
 
 The launcher writes CSV files with Chinese column names and Chinese status text.
 
+## Automatic Deep Research
+
+After a watchlist CSV is generated, the launcher automatically starts Deep
+Research in the background for every unique stock in that CSV. The original CSV
+opens immediately. When research is complete, the consolidated HTML report
+opens automatically and two additional files are saved beside the original:
+
+```text
+stock_watchlist_<model>_<timestamp>_深度研究.html
+stock_watchlist_<model>_<timestamp>_深度研究.csv
+```
+
+The enriched CSV preserves every original model row and adds research posture,
+confidence, hard limits, relative valuation, DCF role and values, catalyst,
+risk, invalidation, and the per-stock research directory. Duplicate stocks
+selected by multiple models are researched only once and merged back to every
+matching row.
+
+Optional environment switches:
+
+- `DEEP_RESEARCH_AUTO=0`: disable automatic Deep Research.
+- `DEEP_RESEARCH_MAX_STOCKS=5`: research only the five stocks with the highest
+  model score; the default `0` researches all unique stocks.
+- `DEEP_RESEARCH_HORIZON=SHORT|MEDIUM|LONG`: default is `MEDIUM`.
+- `DEEP_RESEARCH_OPEN_REPORT=0`: generate the HTML without opening it.
+- `DEEP_RESEARCH_BACKGROUND=0`: wait for Deep Research in the launcher instead
+  of detaching it; intended for diagnostics and integration testing.
+
+If Deep Research fails, the original watchlist remains available and the error
+is recorded in the matching `*_深度研究运行.log` file.
+
 ## Run With The Installed Candidate Universe
 
 From the workspace root:

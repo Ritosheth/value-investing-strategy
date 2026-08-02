@@ -155,6 +155,24 @@ def model_evidence(warnings: list[str], codes: list[str]) -> dict[str, list[dict
     return by_code
 
 
+def load_model_rows(path: Path, warnings: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Reuse the watchlist rows that triggered research instead of rerunning models."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        warnings.append(f"model rows file unavailable: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        warnings.append("model rows file must contain an object keyed by six-digit code")
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for key, rows in data.items():
+        code = str(key).split(".")[0]
+        if re.fullmatch(r"\d{6}", code) and isinstance(rows, list):
+            result[code] = [row for row in rows if isinstance(row, dict)]
+    return result
+
+
 def numeric(row: dict[str, Any], key: str) -> float | None:
     value = row.get(key)
     try:
@@ -375,10 +393,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Collect Futu/OpenD evidence for deep stock research")
     parser.add_argument("codes", nargs="+", help="A-share, Hong Kong, or US tickers")
     parser.add_argument("--output", type=Path, required=True, help="Evidence JSON output path")
+    parser.add_argument("--model-rows-json", type=Path, help="Reuse the stock-system rows that triggered this research run")
     args = parser.parse_args()
     warnings: list[str] = []
     normalized = [normalize_ticker(code) for code in args.codes]
-    model_map = model_evidence(warnings, [ticker["futu_code"] for ticker in normalized])
+    model_map = load_model_rows(args.model_rows_json, warnings) if args.model_rows_json else model_evidence(
+        warnings, [ticker["futu_code"] for ticker in normalized]
+    )
     output: dict[str, Any] = {}
     for ticker in normalized:
         rows = model_map.get(ticker["code"].split(".")[0], [])

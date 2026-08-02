@@ -63,7 +63,13 @@ def main() -> int:
             client.refresh_market_snapshot()
     selected = MODELS.values() if args.model == "all" else [MODELS[args.model]]
 
-    results = [module.run(client, config) for module in selected]
+    # Futu SDK connection logs are emitted on stdout by some API paths. Keep
+    # CSV stdout machine-readable by routing every model-run log to stderr.
+    if args.format == "csv":
+        with redirect_stdout(sys.stderr):
+            results = [module.run(client, config) for module in selected]
+    else:
+        results = [module.run(client, config) for module in selected]
     if args.format == "json":
         print(json.dumps([result.to_dict() for result in results], ensure_ascii=False, indent=2))
     elif args.format == "csv":
@@ -82,7 +88,11 @@ def main() -> int:
                 print("\nWarnings:")
                 for warning in result.warnings:
                     print(f"- {warning}")
-    client.close()
+    if args.format == "csv":
+        with redirect_stdout(sys.stderr):
+            client.close()
+    else:
+        client.close()
     return 0
 
 

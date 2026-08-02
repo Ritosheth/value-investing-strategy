@@ -10,6 +10,12 @@ TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 OUTPUT_FILE="$OUTPUT_DIR/stock_watchlist_${MODEL}_${TIMESTAMP}.csv"
 TEMP_FILE="$OUTPUT_FILE.tmp"
 ERROR_FILE="$OUTPUT_DIR/stock_watchlist_${MODEL}_${TIMESTAMP}_错误说明.txt"
+DEEP_RESEARCH_AUTO="${DEEP_RESEARCH_AUTO:-1}"
+DEEP_RESEARCH_HORIZON="${DEEP_RESEARCH_HORIZON:-MEDIUM}"
+DEEP_RESEARCH_MAX_STOCKS="${DEEP_RESEARCH_MAX_STOCKS:-0}"
+DEEP_RESEARCH_OPEN_REPORT="${DEEP_RESEARCH_OPEN_REPORT:-1}"
+DEEP_RESEARCH_BACKGROUND="${DEEP_RESEARCH_BACKGROUND:-1}"
+DEEP_RESEARCH_LOG="$OUTPUT_DIR/stock_watchlist_${MODEL}_${TIMESTAMP}_深度研究运行.log"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -52,6 +58,45 @@ else
   rm -f "$TEMP_FILE"
   printf '%s\n' "$ERROR_FILE"
   exit 0
+fi
+
+# Return the original CSV immediately in the default background mode so the
+# Finder app remains responsive. Set DEEP_RESEARCH_AUTO=0 to disable research,
+# or DEEP_RESEARCH_BACKGROUND=0 to wait for research (useful for diagnostics).
+if [ "$DEEP_RESEARCH_AUTO" != "0" ]; then
+  if [ "$DEEP_RESEARCH_BACKGROUND" != "0" ]; then
+    if [ "$DEEP_RESEARCH_OPEN_REPORT" != "0" ]; then
+      "$SYSTEM_DIR/env.sh" "$SYSTEM_DIR/launch_deep_research.py" \
+        --watchlist-csv "$OUTPUT_FILE" \
+        --timestamp "$TIMESTAMP" \
+        --horizon "$DEEP_RESEARCH_HORIZON" \
+        --max-stocks "$DEEP_RESEARCH_MAX_STOCKS" \
+        --log "$DEEP_RESEARCH_LOG" \
+        --open-report >> "$DEEP_RESEARCH_LOG" 2>&1 || true
+    else
+      "$SYSTEM_DIR/env.sh" "$SYSTEM_DIR/launch_deep_research.py" \
+        --watchlist-csv "$OUTPUT_FILE" \
+        --timestamp "$TIMESTAMP" \
+        --horizon "$DEEP_RESEARCH_HORIZON" \
+        --max-stocks "$DEEP_RESEARCH_MAX_STOCKS" \
+        --log "$DEEP_RESEARCH_LOG" >> "$DEEP_RESEARCH_LOG" 2>&1 || true
+    fi
+  else
+    if [ "$DEEP_RESEARCH_OPEN_REPORT" != "0" ]; then
+      "$SYSTEM_DIR/env.sh" "$SYSTEM_DIR/deep_research_pipeline.py" \
+        --watchlist-csv "$OUTPUT_FILE" \
+        --timestamp "$TIMESTAMP" \
+        --horizon "$DEEP_RESEARCH_HORIZON" \
+        --max-stocks "$DEEP_RESEARCH_MAX_STOCKS" \
+        --open-report > "$DEEP_RESEARCH_LOG" 2>&1 || true
+    else
+      "$SYSTEM_DIR/env.sh" "$SYSTEM_DIR/deep_research_pipeline.py" \
+        --watchlist-csv "$OUTPUT_FILE" \
+        --timestamp "$TIMESTAMP" \
+        --horizon "$DEEP_RESEARCH_HORIZON" \
+        --max-stocks "$DEEP_RESEARCH_MAX_STOCKS" > "$DEEP_RESEARCH_LOG" 2>&1 || true
+    fi
+  fi
 fi
 
 printf '%s\n' "$OUTPUT_FILE"
