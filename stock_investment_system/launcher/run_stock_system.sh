@@ -16,6 +16,20 @@ DEEP_RESEARCH_MAX_STOCKS="${DEEP_RESEARCH_MAX_STOCKS:-0}"
 DEEP_RESEARCH_OPEN_REPORT="${DEEP_RESEARCH_OPEN_REPORT:-1}"
 DEEP_RESEARCH_BACKGROUND="${DEEP_RESEARCH_BACKGROUND:-1}"
 DEEP_RESEARCH_LOG="$OUTPUT_DIR/stock_watchlist_${MODEL}_${TIMESTAMP}_深度研究运行.log"
+ASHAREHUB_KEYCHAIN_SERVICE="BYStock.AShareHub"
+
+load_asharehub_key() {
+  if [ -n "${ASHAREHUB_API_KEY:-}" ]; then
+    return 0
+  fi
+  if [ -x /usr/bin/security ]; then
+    ASHAREHUB_API_KEY="$(/usr/bin/security find-generic-password \
+      -a "$(/usr/bin/id -un)" \
+      -s "$ASHAREHUB_KEYCHAIN_SERVICE" \
+      -w 2>/dev/null || true)"
+    export ASHAREHUB_API_KEY
+  fi
+}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -23,6 +37,10 @@ mkdir -p "$OUTPUT_DIR"
 # Run from the directory that contains the stock_investment_system package so
 # Python can resolve `stock_investment_system.run_models` reliably.
 cd "$PROJECT_DIR"
+
+# Finder/AppleScript does not source ~/.zshrc. Load the AShareHub credential
+# from macOS Keychain without writing it to source files or logs.
+load_asharehub_key
 
 if "$SYSTEM_DIR/env.sh" -m stock_investment_system.run_models \
     --model "$MODEL" \
@@ -64,6 +82,9 @@ fi
 # Finder app remains responsive. Set DEEP_RESEARCH_AUTO=0 to disable research,
 # or DEEP_RESEARCH_BACKGROUND=0 to wait for research (useful for diagnostics).
 if [ "$DEEP_RESEARCH_AUTO" != "0" ]; then
+  if [ -z "${ASHAREHUB_API_KEY:-}" ]; then
+    echo "警告：未能从 macOS 钥匙串读取 AShareHub 密钥；本次深研将保留相应证据缺口。" >> "$DEEP_RESEARCH_LOG"
+  fi
   if [ "$DEEP_RESEARCH_BACKGROUND" != "0" ]; then
     if [ "$DEEP_RESEARCH_OPEN_REPORT" != "0" ]; then
       "$SYSTEM_DIR/env.sh" "$SYSTEM_DIR/launch_deep_research.py" \

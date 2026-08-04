@@ -261,6 +261,8 @@ class RuntimeModuleTests(unittest.TestCase):
         self.assertIn("launch_deep_research.py", script)
         self.assertIn("DEEP_RESEARCH_BACKGROUND", script)
         self.assertIn("DEEP_RESEARCH_AUTO", script)
+        self.assertIn("BYStock.AShareHub", script)
+        self.assertIn("security find-generic-password", script)
 
     def test_csv_output_starts_with_header_when_refresh_prints_logs(self) -> None:
         stream = StringIO()

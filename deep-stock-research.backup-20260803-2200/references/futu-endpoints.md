@@ -7,12 +7,10 @@ Use `docs/Futu-API-Doc-en-Python.md` as the authoritative signature and field re
 | Need | Endpoint | Notes |
 |---|---|---|
 | Snapshot | `get_market_snapshot` | Price, status, liquidity, market cap, PE/PB, and 52-week range. |
-| Price history | **Do not call `request_history_kline`** | Use the non-Futu Tencent → Sina → Eastmoney chain for requested stocks, benchmarks, and same-plate constituents. |
+| Price history | `request_history_kline` | Use for requested stocks only; paginate and preserve adjustment mode. |
 | Flow | `get_capital_flow`, `get_capital_distribution` | Calculate multi-window persistence; distribution is current context only. |
 | Plates | `get_owner_plate`, `get_plate_list`, `get_plate_stock` | Keep industry and concepts distinct. |
 | Mainline | `get_heat_map_data`, `get_rise_fall_distribution`, industrial-chain endpoints | Prefer saved snapshots when available. |
-
-Before making stock-level MA or support/resistance judgments, prefer the same-date saved `outputs/daily_model_results/YYYYMMDD/market_risk_snapshot.json` for broad-market trend and breadth. Use non-Futu index/constituent history and dated breadth evidence to fill missing same-cutoff context. Futu rise/fall distribution may supplement a live same-cutoff snapshot, but Futu historical K-lines are prohibited. Preserve universe and timestamp because market-wide decline and limit-down counts vary by provider coverage and definitions.
 
 ## Financial and business
 

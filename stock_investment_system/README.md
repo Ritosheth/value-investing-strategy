@@ -84,6 +84,11 @@ Optional environment switches:
 If Deep Research fails, the original watchlist remains available and the error
 is recorded in the matching `*_深度研究运行.log` file.
 
+On macOS, the Finder launcher reads the AShareHub API key from the login
+Keychain item named `BYStock.AShareHub`. This avoids depending on interactive
+shell startup files such as `~/.zshrc` and keeps the key out of source files and
+research logs.
+
 ## Run With The Installed Candidate Universe
 
 From the workspace root:

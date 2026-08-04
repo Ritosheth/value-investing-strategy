@@ -67,6 +67,17 @@ class DeepResearchPipelineTests(unittest.TestCase):
                 "models": "质量成长、行业轮动",
                 "model_max_score": 76.0,
                 "directory": research_dir,
+                "raw": {},
+                "conclusion": {
+                    "posture": "TIMING WATCH",
+                    "total_score": 72,
+                    "confidence": "LOW",
+                    "position_band": "2%-4%",
+                    "hard_limits": [],
+                    "next_catalyst": "下一期财报",
+                    "key_risk": "估值偏高",
+                    "primary_invalidation": "利润转负",
+                },
                 "derived": {
                     "research_score": {"posture": "TIMING WATCH", "total_score": 72, "confidence": "HIGH", "position_band": "2%-4%", "hard_limits": []},
                     "fair_value": {"available": True, "scenarios": {"bear": {"value": 300}, "base": {"value": 380, "upside_pct": 5}, "bull": {"value": 430}}, "current_price_implied_basis": {"available": True, "required_growth_pct": 10}},
@@ -79,11 +90,20 @@ class DeepResearchPipelineTests(unittest.TestCase):
             source_rows = [self.sample_rows()[0]]
             csv_path = root / "enhanced.csv"
             html_path = root / "summary.html"
+            portfolio_path = root / "portfolio.md"
             original_path = root / "original.csv"
             original_path.write_text("", encoding="utf-8")
+            portfolio_path.write_text("", encoding="utf-8")
 
             write_enriched_csv(csv_path, list(source_rows[0]), source_rows, {"300750.SZ": summary})
-            write_html(html_path, original_path, csv_path, [summary], __import__("datetime").datetime.now())
+            write_html(
+                html_path,
+                original_path,
+                csv_path,
+                portfolio_path,
+                [summary],
+                __import__("datetime").datetime.now(),
+            )
 
             with csv_path.open(encoding="utf-8-sig", newline="") as handle:
                 row = next(csv.DictReader(handle))
@@ -93,7 +113,7 @@ class DeepResearchPipelineTests(unittest.TestCase):
             self.assertEqual(row["深研姿态"], "TIMING WATCH")
             self.assertEqual(row["相对估值基准值"], "380")
             self.assertIn("宁德时代", html_text)
-            self.assertIn("低置信度", html_text)
+            self.assertIn("LOW", html_text)
 
     def test_summary_columns_preserves_failure_without_crashing(self):
         result = summary_columns({"error": "研究失败"})

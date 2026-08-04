@@ -1,936 +1,923 @@
-#!/usr/bin/env python3
+"""Collect reproducible stock-research data and build a deterministic brief.
+
+The script is intentionally separate from the daily stock-selection pipeline.
+It collects only explicitly requested stocks and stores raw evidence, derived
+metrics, warnings, and a Chinese report brief for later LLM-assisted research.
+"""
+
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from _stockselection_env import ensure_stockselection_venv
+
+    ensure_stockselection_venv()
+
 import argparse
-import csv
+import datetime as dt
 import json
+import math
+import os
 import re
+import sqlite3
 import sys
-from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import pandas as pd
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-from valuation_engine import derive_dcf_valuation
+from stock_selection.config import DEFAULT_DB_PATH
+from stock_selection.futu_client import FutuClient, FutuUnavailable, payload_frame
+from stock_selection.futu_runtime import prepare_futu_runtime
+from stock_selection.market_data.a_share_history import fetch_a_share_history
+from stock_selection.utils import normalize_code
 
 
-COMPONENTS = {
-    "model": {"weight": 15, "critical": False},
-    "financial_quality": {"weight": 20, "critical": True},
-    "valuation": {"weight": 15, "critical": True},
-    "catalyst": {"weight": 15, "critical": False},
-    "technical_flow": {"weight": 15, "critical": True},
-    "governance_risk": {"weight": 15, "critical": True},
-    "data_confidence": {"weight": 5, "critical": False},
+ASHARE_ENDPOINTS: dict[str, tuple[str, str | None]] = {
+    "stock": ("stock_list", None),
+    "market_daily": ("market_daily", "20240101"),
+    "fundamentals": ("fundamentals", "20240101"),
+    "financial_indicators": ("financial_indicators", "20230101"),
+    "income": ("income", "20230101"),
+    "balance_sheet": ("balance_sheet", "20230101"),
+    "cash_flow": ("cash_flow", "20230101"),
+    "forecast": ("forecast", "20240101"),
+    "express": ("express", "20240101"),
+    "audit": ("audit", "20220101"),
+    "main_business": ("main_business", "20230101"),
+    "disclosure_date": ("disclosure_date", "20250101"),
+    "analyst_reports": ("analyst_reports", "20250101"),
+    "shareholders": ("shareholders", "20230101"),
+    "holder_trade": ("holder_trade", "20230101"),
+    "margin": ("margin", "20250101"),
+    "block_trade": ("block_trade", "20250101"),
+    "top_list": ("top_list", "20250101"),
+    "top_inst": ("top_inst", "20250101"),
+    "moneyflow": ("moneyflow", "20250101"),
+    "northbound_holdings": ("northbound_holdings", "20240101"),
+    "technical_factors": ("technical_factors", "20250101"),
+    "chip_distribution": ("chip_distribution", "20250101"),
+    "dividend": ("dividend", "20200101"),
 }
 
-
-POSTURE_ORDER = [
-    "CORE CANDIDATE",
-    "TIMING WATCH",
-    "EVENT CANDIDATE",
-    "REJECT-RISK WATCH",
-    "INSUFFICIENT EVIDENCE",
-]
-
-
-def normalize_ticker(value: str) -> dict[str, str]:
-    original = value.strip()
-    code = original.upper().replace("_", ".")
-    code = re.sub(r"\s+", "", code)
-
-    if re.fullmatch(r"\d{6}", code):
-        suffix = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8")) else "SZ"
-        normalized = f"{code}.{suffix}"
-        return {"input": original, "code": normalized, "market": "A", "futu_code": f"{suffix}.{code}", "name": normalized}
-
-    if re.fullmatch(r"\d{1,5}\.HK", code):
-        number = code.split(".")[0].zfill(5)
-        normalized = f"{number}.HK"
-        return {"input": original, "code": normalized, "market": "HK", "futu_code": f"HK.{number}", "name": normalized}
-
-    if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
-        number, suffix = code.split(".")
-        return {"input": original, "code": code, "market": "A", "futu_code": f"{suffix}.{number}", "name": code}
-
-    if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}(\.US)?", code):
-        symbol = code.removesuffix(".US")
-        return {"input": original, "code": f"{symbol}.US", "market": "US", "futu_code": f"US.{symbol}", "name": f"{symbol}.US"}
-
-    raise ValueError(f"Unsupported ticker format: {original}")
+ASHARE_CORE_ENDPOINTS = (
+    "stock",
+    "fundamentals",
+    "financial_indicators",
+    "income",
+    "balance_sheet",
+    "cash_flow",
+    "disclosure_date",
+    "shareholders",
+)
+ASHARE_DAILY_LIMIT = 100
+ASHARE_DEFAULT_RESERVE = 20
+ASHARE_DEFAULT_RUN_BUDGET = 80
 
 
-def score_research(evidence: dict[str, Any]) -> dict[str, Any]:
-    component_scores: dict[str, float] = {}
-    unavailable: list[str] = []
-    hard_limits: list[str] = []
-
-    for name, meta in COMPONENTS.items():
-        value = _component_score(evidence.get(name))
-        if value is None:
-            unavailable.append(name)
-            value = 0.0
-        component_scores[name] = value
-
-    total = sum(component_scores[name] * COMPONENTS[name]["weight"] / 100 for name in COMPONENTS)
-    total = round(total * 2) / 2
-    confidence = _confidence(component_scores, unavailable)
-
-    if component_scores["governance_risk"] and component_scores["governance_risk"] < 45:
-        hard_limits.append("governance_risk_below_45")
-    if component_scores["valuation"] and component_scores["valuation"] < 35:
-        hard_limits.append("valuation_below_35")
-    if component_scores["technical_flow"] and component_scores["technical_flow"] < 35:
-        hard_limits.append("technical_flow_below_35")
-
-    missing_critical = [name for name in unavailable if COMPONENTS[name]["critical"]]
-    if missing_critical:
-        posture = "INSUFFICIENT EVIDENCE"
-    elif hard_limits:
-        posture = "REJECT-RISK WATCH"
-    elif total >= 75 and confidence in {"HIGH", "MEDIUM"}:
-        posture = "CORE CANDIDATE"
-    elif total >= 68:
-        posture = "TIMING WATCH"
-    elif total >= 60 and component_scores["catalyst"] >= 70:
-        posture = "EVENT CANDIDATE"
-    elif total >= 55:
-        posture = "REJECT-RISK WATCH"
-    else:
-        posture = "INSUFFICIENT EVIDENCE"
-
-    return {
-        "total_score": total,
-        "component_scores": component_scores,
-        "weights": {name: meta["weight"] for name, meta in COMPONENTS.items()},
-        "posture": posture,
-        "confidence": confidence,
-        "position_band": position_band(posture, confidence, hard_limits, unavailable),
-        "unavailable_components": unavailable,
-        "hard_limits": hard_limits,
-    }
-
-
-def position_band(posture: str, confidence: str, hard_limits: list[str], unavailable: list[str]) -> str:
-    if hard_limits or posture in {"REJECT-RISK WATCH", "INSUFFICIENT EVIDENCE"}:
-        return "0%"
-    if confidence == "LOW" or len(unavailable) >= 2:
-        return "0%-2%"
-    if posture == "CORE CANDIDATE":
-        return "4%-6%" if confidence == "HIGH" else "2%-4%"
-    if posture == "TIMING WATCH":
-        return "2%-4%"
-    if posture == "EVENT CANDIDATE":
-        return "0%-2%"
-    return "0%"
-
-
-def apply_valuation_constraints(
-    research_score: dict[str, Any],
-    fair_value: dict[str, Any],
-    dcf_valuation: dict[str, Any],
-    risk_profile: str = "平衡",
-) -> dict[str, Any]:
-    """Apply only sufficiently evidenced valuation anchors to the decision."""
-    out = dict(research_score)
-    out["hard_limits"] = list(research_score.get("hard_limits", []))
-    out["unavailable_components"] = list(research_score.get("unavailable_components", []))
-    anchors: dict[str, float] = {}
-    if fair_value.get("available") and int(fair_value.get("multiple_sample_size") or 0) >= 30:
-        upside = _numeric(fair_value.get("scenarios", {}).get("base", {}).get("upside_pct"))
-        if upside is not None:
-            anchors["relative_base_upside_pct"] = upside
-    if dcf_valuation.get("available") and dcf_valuation.get("decision_usable", False):
-        upside = _numeric(dcf_valuation.get("scenarios", {}).get("base", {}).get("upside_pct"))
-        if upside is not None:
-            anchors["dcf_base_upside_pct"] = upside
-
-    cautions: list[str] = []
-    if anchors and max(anchors.values()) <= -20.0:
-        out["hard_limits"].append("reliable_valuation_downside_below_20pct")
-    if len(anchors) >= 2 and max(anchors.values()) - min(anchors.values()) >= 50.0:
-        cautions.append("valuation_methods_disagree_by_50pct")
-        out["confidence"] = "LOW"
-
-    out["hard_limits"] = list(dict.fromkeys(out["hard_limits"]))
-    if out["hard_limits"]:
-        out["posture"] = "REJECT-RISK WATCH"
-    out["position_band"] = position_band(
-        out["posture"], out["confidence"], out["hard_limits"], out["unavailable_components"]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect Futu, AShareHub, and saved-model evidence for on-demand deep stock research."
     )
-    if risk_profile == "保守" and out["position_band"] in {"4%-6%", "2%-4%"}:
-        out["position_band"] = "2%-4%" if out["position_band"] == "4%-6%" else "0%-2%"
-    out["valuation_constraints"] = {"usable_anchors": anchors, "cautions": cautions, "risk_profile": risk_profile}
-    return out
-
-
-def load_evidence(path: Path | None) -> dict[str, Any]:
-    if path is None:
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("--evidence-json must contain a JSON object")
-    # Also accept a previously generated research_raw.json for reproducible
-    # re-rendering without re-querying Futu/OpenD.
-    if isinstance(data.get("evidence"), dict) and isinstance(data.get("ticker"), dict):
-        code = data["ticker"].get("code")
-        if code:
-            return {str(code): data["evidence"]}
-    return data
-
-
-def select_evidence(all_evidence: dict[str, Any], ticker: dict[str, str]) -> dict[str, Any]:
-    for key in (ticker["code"], ticker["input"], ticker["futu_code"], ticker["code"].split(".")[0]):
-        value = all_evidence.get(key)
-        if isinstance(value, dict):
-            return value
-    if _looks_like_single_stock_evidence(all_evidence):
-        return all_evidence
-    return {}
-
-
-def write_bundle(
-    ticker: dict[str, str],
-    evidence: dict[str, Any],
-    output_root: Path,
-    as_of: date,
-    horizon: str,
-    language: str,
-    risk_profile: str = "平衡",
-    investment_style: str = "未指定",
-    research_depth: str = "标准尽调",
-) -> dict[str, Any]:
-    date_dir = output_root / as_of.strftime("%Y%m%d")
-    display_ticker = enrich_ticker_name(ticker, evidence)
-    stock_dir = date_dir / safe_dir_name(display_ticker["name"])
-    stock_dir.mkdir(parents=True, exist_ok=True)
-
-    warnings = evidence.get("warnings", [])
-    if not isinstance(warnings, list):
-        warnings = [str(warnings)]
-    if not evidence:
-        warnings.append("No structured evidence was supplied; all unavailable components are scored as gaps.")
-
-    raw = {
-        "ticker": display_ticker,
-        "as_of": as_of.isoformat(),
-        "horizon": horizon,
-        "language": language,
-        "risk_profile": risk_profile,
-        "investment_style": investment_style,
-        "research_depth": research_depth,
-        "evidence": evidence,
-        "warnings": warnings,
-        "sources": evidence.get("sources", []) if isinstance(evidence.get("sources", []), list) else [],
-    }
-    research_score = score_research(evidence)
-    fair_value = derive_fair_value(evidence, as_of, horizon)
-    dcf_valuation = derive_dcf_valuation(evidence, horizon)
-    research_score = apply_valuation_constraints(research_score, fair_value, dcf_valuation, risk_profile)
-    research_context = derive_research_context(evidence, research_score, fair_value, dcf_valuation)
-    derived = {
-        "ticker": display_ticker,
-        "as_of": as_of.isoformat(),
-        "horizon": horizon,
-        "research_score": research_score,
-        "fair_value": fair_value,
-        "dcf_valuation": dcf_valuation,
-        "next_catalyst": _field(evidence, "catalyst", "next_catalyst") or evidence.get("next_catalyst") or research_context["next_catalyst"],
-        "primary_invalidation": evidence.get("primary_invalidation") or research_context["primary_invalidation"],
-        "key_risk": evidence.get("key_risk") or research_context["key_risk"],
-        "research_context": research_context,
-        "calculation_notes": [
-            "Scores are deterministic weighted component scores.",
-            "Unavailable evidence is listed explicitly and does not receive neutral credit.",
-            "DCF is a deterministic FCFF scenario model and fails closed when annual cash-flow or capital-structure evidence is insufficient.",
-            "Reliable relative valuation and decision-usable DCF outputs constrain posture and shadow position sizing.",
-            "Risk profile adjusts the shadow position ceiling; style and depth are retained as auditable request context.",
-            "Position bands are shadow-only research sizing guidance, not production portfolio changes.",
-        ],
-    }
-
-    (stock_dir / "research_raw.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    (stock_dir / "research_derived.json").write_text(json.dumps(derived, ensure_ascii=False, indent=2), encoding="utf-8")
-    (stock_dir / "research_brief.md").write_text(render_brief(raw, derived), encoding="utf-8")
-    return {
-        "code": ticker["code"],
-        "output_dir": str(stock_dir),
-        "research_score": research_score,
-        "industry": _evidence_industry(evidence),
-        "current_price": fair_value.get("current_price") or dcf_valuation.get("current_price"),
-        "fair_value_base": fair_value.get("scenarios", {}).get("base", {}).get("value") if fair_value.get("available") else None,
-        "dcf_value_base": dcf_valuation.get("scenarios", {}).get("base", {}).get("value") if dcf_valuation.get("available") and dcf_valuation.get("decision_usable") else None,
-    }
-
-
-def render_brief(raw: dict[str, Any], derived: dict[str, Any]) -> str:
-    ticker = raw["ticker"]
-    score = derived["research_score"]
-    unavailable = ", ".join(score["unavailable_components"]) or "无"
-    hard_limits = ", ".join(score["hard_limits"]) or "无"
-    warnings = raw["warnings"] or ["无"]
-
-    lines = [
-        f"# {ticker['name']} 深度研究证据简报",
-        "",
-        "## 研究快照",
-        f"- 股票代码：{ticker['code']}",
-        f"- 股票名称：{ticker['name']}",
-        f"- 市场：{ticker['market']}",
-        f"- 截止日期：{raw['as_of']}",
-        f"- 研究周期：{raw['horizon']}",
-        f"- 研究姿态：{score['posture']}",
-        f"- 研究置信度：{score['confidence']}",
-        f"- 综合评分：{score['total_score']}",
-        "",
-        "## 合理价值区间（相对估值）",
-    ]
-    fair_value = derived.get("fair_value", {})
-    if fair_value.get("available"):
-        lines.extend(
-            [
-                f"- 当前股价：{fair_value['current_price']:.2f} 元",
-                f"- 当前估值：{fair_value['multiple_name']} {fair_value['current_multiple']:.2f} 倍，历史估值分位 {fair_value['valuation_percentile']:.1f}%",
-                f"- 估值基准：{fair_value['basis_label']} {fair_value['basis_value']:.4f} 元 × 近{fair_value['lookback_years']}年历史 {fair_value['multiple_name']} 分位数",
-                f"- 财务基准来源：{fair_value.get('basis_derivation', '财务指标直接值')}",
-                f"- 保守情景：{fair_value['multiple_name']} {fair_value['scenarios']['bear']['multiple']:.2f}，合理价值 {fair_value['scenarios']['bear']['value']:.2f} 元，较现价 {fair_value['scenarios']['bear']['upside_pct']:+.1f}%",
-                f"- 基准情景：{fair_value['multiple_name']} {fair_value['scenarios']['base']['multiple']:.2f}，合理价值 {fair_value['scenarios']['base']['value']:.2f} 元，较现价 {fair_value['scenarios']['base']['upside_pct']:+.1f}%",
-                f"- 乐观情景：{fair_value['multiple_name']} {fair_value['scenarios']['bull']['multiple']:.2f}，合理价值 {fair_value['scenarios']['bull']['value']:.2f} 元，较现价 {fair_value['scenarios']['bull']['upside_pct']:+.1f}%",
-                f"- 口径说明：不假设未来盈利增长；这是基于历史 {fair_value['multiple_name']} 的估值锚定区间，不等同于券商目标价或确定性收益预测。样本数 {fair_value['multiple_sample_size']} 个交易日。",
-            ]
-        )
-        implied_basis = fair_value.get("current_price_implied_basis", {})
-        if implied_basis.get("available"):
-            lines.append(
-                f"- 现价反推：若回到历史中位 {fair_value['multiple_name']} {fair_value['scenarios']['base']['multiple']:.2f} 倍，"
-                f"需 {fair_value['basis_label']} 达到 {implied_basis['required_basis_value']:.4f} 元，"
-                f"相当于当前基准值的 {implied_basis['multiple_of_current_basis']:.2f} 倍（增幅 {implied_basis['required_growth_pct']:+.1f}%）。"
-            )
-    else:
-        lines.append(f"- 暂无法计算：{fair_value.get('reason', '缺少股价、TTM EPS 或历史估值数据')}")
-
-    dcf = derived.get("dcf_valuation", {})
-    lines.extend(["", "## 目标价区间（FCFF DCF）"])
-    if dcf.get("available"):
-        currency = dcf.get("currency", "CNY")
-        scenarios = dcf["scenarios"]
-        value_label = "目标价" if dcf.get("decision_usable", True) else "现金流底值"
-        lines.extend(
-            [
-                f"- 当前股价：{dcf['current_price']:.2f} {currency}",
-                f"- 保守{value_label}：{scenarios['bear']['value']:.2f} {currency}，较现价 {scenarios['bear']['upside_pct']:+.1f}%",
-                f"- 基准{value_label}：{scenarios['base']['value']:.2f} {currency}，较现价 {scenarios['base']['upside_pct']:+.1f}%",
-                f"- 乐观{value_label}：{scenarios['bull']['value']:.2f} {currency}，较现价 {scenarios['bull']['upside_pct']:+.1f}%",
-                f"- 基准假设：未来{dcf.get('forecast_years', 5)}年收入增速 {scenarios['base']['revenue_growth_pct']:.2f}%，FCFF利润率 {scenarios['base']['fcff_margin_pct']:.2f}%，WACC {scenarios['base']['wacc_pct']:.2f}%，永续增长率 {scenarios['base']['terminal_growth_pct']:.2f}%",
-                f"- 现金流口径：历史 {len(dcf['historical_inputs']['years'])} 个年度，归一化 FCFF 利润率 {dcf['historical_inputs']['normalized_fcff_margin_pct']:.2f}%，模型置信度 {dcf['confidence']}",
-                f"- 净债务调整：{dcf['capital_structure']['net_debt_per_share']:.2f} {currency}/股（负数表示净现金）",
-            ]
-        )
-        if not dcf.get("decision_usable", True):
-            lines.append("- 适用性提示：历史 FCFF 波动过大，本组数值仅作为低置信度现金流底值，不作为主要目标价；优先参考相对估值及未来盈利预测。")
-        implied = dcf.get("implied_revenue_growth", {})
-        if implied.get("available"):
-            lines.append(f"- 当前价格隐含增速：未来{dcf.get('forecast_years', 5)}年收入年均增长 {implied['annual_revenue_growth_pct']:.2f}%")
-        else:
-            lines.append(f"- 当前价格隐含增速：超出模型搜索区间 -20% 至 50%（{implied.get('status', 'Unavailable')}）")
-        lines.extend(["", "### WACC / 永续增长率敏感性（每股价值）", "", "| WACC \\ 永续增长率 | " + " | ".join(f"{value:.2f}%" for value in dcf["sensitivity"]["terminal_growth_columns_pct"]) + " |", "|---:" + "|---:" * len(dcf["sensitivity"]["terminal_growth_columns_pct"]) + "|"])
-        for row in dcf["sensitivity"]["rows"]:
-            lines.append(f"| {row['wacc_pct']:.2f}% | " + " | ".join(f"{cell['value']:.2f}" for cell in row["values"]) + " |")
-        lines.extend(["", "- 口径说明：这是基于明确假设的情景估值，不是确定性收益承诺；WACC、增长率和现金流利润率均可在 JSON 中逐项审计。"])
-    else:
-        lines.append(f"- 暂无法计算：{dcf.get('reason', '年度 FCFF 或资本结构证据不足')}")
-    lines.extend(
-        [
-            "",
-            "## 仓位建议",
-            f"- 影子仓位区间：{score['position_band']}",
-            "- 说明：该区间只用于研究优先级和组合讨论，不自动改写生产模型、实盘仓位或参数。",
-            "",
-            "## 评分拆解",
-        ]
+    parser.add_argument("codes", nargs="+", help="Stock codes, e.g. 603444, SH.603444, 00700, US.AAPL.")
+    parser.add_argument("--as-of", default=dt.date.today().isoformat(), help="Research cutoff date (YYYY-MM-DD).")
+    parser.add_argument("--history-start", default=None, help="Price/flow start date; defaults to 550 calendar days ago.")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Date-level output root; each stock is saved below its stock-name directory.",
     )
-    constraints = score.get("valuation_constraints", {})
-    anchors = constraints.get("usable_anchors", {}) if isinstance(constraints, dict) else {}
-    if anchors:
-        score_heading = lines.index("## 评分拆解")
-        anchor_text = "，".join(f"{name} {value:+.1f}%" for name, value in anchors.items())
-        lines[score_heading:score_heading] = [
-            f"- 已生效估值约束：{anchor_text}",
-            "",
-        ]
-    for name, value in score["component_scores"].items():
-        lines.append(f"- {name}：{value}，权重 {score['weights'][name]}%")
-    lines.extend(
-        [
-            "",
-            "## 证据缺口",
-            f"- 不可用组件：{unavailable}",
-            f"- 硬性限制：{hard_limits}",
-            "",
-            "## 下一催化与证伪",
-            f"- 下一催化：{derived.get('next_catalyst') or 'Unavailable'}",
-            f"- 主要风险：{derived.get('key_risk')}",
-            f"- 证伪触发：{derived.get('primary_invalidation')}",
-            "",
-            "## 采集警告",
-        ]
+    parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Prediction-ledger SQLite path.")
+    parser.add_argument("--futu-host", default="127.0.0.1")
+    parser.add_argument("--futu-port", type=int, default=11111)
+    parser.add_argument("--skip-futu", action="store_true")
+    parser.add_argument("--skip-asharehub", action="store_true")
+    parser.add_argument(
+        "--asharehub-profile",
+        choices=("core", "full"),
+        default="core",
+        help="Core uses 8 high-value endpoints so a 10-stock watchlist fits the reserved daily budget; full uses all 24.",
     )
-    for warning in warnings:
-        lines.append(f"- {warning}")
-    lines.append("")
-    return "\n".join(lines)
+    parser.add_argument(
+        "--asharehub-budget",
+        type=int,
+        default=ASHARE_DEFAULT_RUN_BUDGET,
+        help="Maximum AShareHub calls for this invocation. Default: 80.",
+    )
+    parser.add_argument(
+        "--asharehub-daily-reserve",
+        type=int,
+        default=ASHARE_DEFAULT_RESERVE,
+        help="Keep this many calls unused from the documented daily quota. Default: 20.",
+    )
+    parser.add_argument(
+        "--refresh-asharehub",
+        action="store_true",
+        help="Ignore same-cutoff AShareHub cache and spend fresh API calls.",
+    )
+    parser.add_argument(
+        "--language",
+        choices=("zh-CN", "en"),
+        default="zh-CN",
+        help="Language for the deterministic report brief; Chinese is the default.",
+    )
+    return parser.parse_args()
 
 
-def derive_fair_value(evidence: dict[str, Any], as_of: date, horizon: str) -> dict[str, Any]:
-    """Derive a traceable three-scenario valuation anchor from local evidence.
-
-    This is intentionally a relative-valuation range rather than a forward price
-    target: the valuation metric returned by Futu is multiplied by recent
-    historical percentiles. PE uses TTM EPS, PB uses book value per share, and
-    PS uses revenue per share. No growth assumption is silently introduced.
-    """
-    snapshot_rows = _data_rows(evidence.get("snapshot"))
-    current_price = _numeric(snapshot_rows[0].get("last_price")) if snapshot_rows else None
-
-    financials = evidence.get("financial_quality", {})
-    if isinstance(financials, dict):
-        financials = financials.get("financials", financials)
-    if not isinstance(financials, dict):
-        financials = {}
-    financial_data = financials.get("data", financials)
-    reports = financial_data.get("report_list", []) if isinstance(financial_data, dict) else []
-    metric_candidates: dict[int, list[tuple[str, float]]] = {1: [], 2: [], 3: []}
-    fallback_eps: list[tuple[str, float]] = []
-    for report in reports if isinstance(reports, list) else []:
-        if not isinstance(report, dict):
-            continue
-        report_date = str(report.get("date_time_str") or report.get("period_text") or "")
-        for item in report.get("item_list", []) if isinstance(report.get("item_list"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            value = _numeric(item.get("data"))
-            if value is None or value <= 0:
-                continue
-            field_id = item.get("field_id")
-            name = str(item.get("display_name", ""))
-            if field_id == 3006 or "每股收益_TTM" in name or "TTM每股收益" in name:
-                metric_candidates[1].append((report_date, value))
-            elif field_id in {1003, 1004, 3005} or "基本每股收益" in name or "稀释每股收益" in name or "每股收益（摊薄）" in name:
-                fallback_eps.append((report_date, value))
-            elif field_id in {1002, 3002} or "每股净资产" in name:
-                metric_candidates[2].append((report_date, value))
-            elif field_id in {1010, 3012} or "每股营业总收入" in name:
-                metric_candidates[3].append((report_date, value))
-
-    valuation = evidence.get("valuation", {})
-    if isinstance(valuation, dict):
-        valuation = valuation.get("valuation_detail", valuation)
-    if not isinstance(valuation, dict):
-        valuation = {}
-    valuation_data = valuation.get("data", valuation)
-    valuation_type = _numeric(valuation_data.get("valuation_type")) if isinstance(valuation_data, dict) else None
-    metric_specs = {
-        1: ("PE", "TTM 每股收益", "EPS", "PE"),
-        2: ("PB", "每股净资产", "BPS", "PB"),
-        3: ("PS", "每股营业总收入", "RPS", "PS"),
-    }
-    spec = metric_specs.get(int(valuation_type or 0))
-    if spec is None:
-        if current_price is None:
-            return {"available": False, "reason": "当前股价缺失；估值类型也缺失或不支持"}
-        return {"available": False, "reason": "估值类型缺失或不支持，未将未知指标误当作 PE"}
-    multiple_name, basis_label, basis_short, _ = spec
-    trend = valuation_data.get("trend", {}) if isinstance(valuation_data, dict) else {}
-    if not isinstance(trend, dict):
-        trend = {}
-    current_multiple = _numeric(trend.get("current_value"))
-    if current_multiple is None or current_multiple <= 0:
-        return {"available": False, "reason": f"当前 {multiple_name} 缺失"}
-
-    basis_derivation = "财务指标直接值"
-    if int(valuation_type) == 1 and not metric_candidates[1]:
-        # Some Futu statement schemas expose quarterly/basic EPS but omit the
-        # dedicated TTM field. Current price/current PE recovers the exact TTM
-        # denominator used by the same valuation endpoint and is safer than
-        # treating Q1 or H1 EPS as a full-year figure.
-        if current_price is not None:
-            metric_candidates[1] = [(f"{as_of.isoformat()}（当前价÷富途当前PE反推）", current_price / current_multiple)]
-            basis_derivation = "当前股价 ÷ 富途当前 PE 反推 TTM EPS"
-        else:
-            metric_candidates[1] = fallback_eps
-            basis_derivation = "最近可用基本/稀释 EPS（非 TTM，低置信度降级）"
-    basis_source = metric_candidates[int(valuation_type)]
-    basis_source.sort(key=lambda item: item[0], reverse=True)
-    basis_value = basis_source[0][1] if basis_source else None
-    if current_price is None or basis_value is None:
-        missing = []
-        if current_price is None:
-            missing.append("当前股价")
-        if basis_value is None:
-            missing.append(basis_label)
-        return {"available": False, "reason": "、".join(missing) + "缺失"}
-
-    implied_multiple = current_price / basis_value
-    if abs(implied_multiple - current_multiple) / max(current_multiple, 1e-9) > 0.25:
-        return {
-            "available": False,
-            "reason": f"当前价格与财务基准不一致：价格/基准值约 {implied_multiple:.2f} 倍，但接口当前 {multiple_name} 为 {current_multiple:.2f} 倍",
-        }
-    historical = trend.get("historical_items", [])
-    cutoff_year = as_of.year - 3
-    cutoff = date(cutoff_year, as_of.month, min(as_of.day, 28))
-    multiple_values: list[float] = []
-    for item in historical if isinstance(historical, list) else []:
-        if not isinstance(item, dict):
-            continue
-        value = _numeric(item.get("value"))
-        if value is None or value <= 0:
-            continue
-        try:
-            item_date = date.fromisoformat(str(item.get("time_str", ""))[:10])
-        except ValueError:
-            continue
-        if cutoff <= item_date <= as_of:
-            multiple_values.append(value)
-
-    if len(multiple_values) < 30:
-        current_multiple = _numeric(trend.get("current_value"))
-        if current_multiple is None or current_multiple <= 0:
-            return {"available": False, "reason": f"近三年历史 {multiple_name} 样本不足，且当前 {multiple_name} 缺失"}
-        multiple_values = [current_multiple]
-        lookback_years = 0
-        basis = f"当前 {multiple_name}（历史样本不足）"
-    else:
-        multiple_values.sort()
-        lookback_years = 3
-        basis = f"近三年历史 {multiple_name} 分位数"
-
-    bear_multiple = _percentile(multiple_values, 0.25)
-    base_multiple = _percentile(multiple_values, 0.50)
-    bull_multiple = _percentile(multiple_values, 0.75)
-    scenarios = {}
-    for key, label, multiple in (("bear", "保守", bear_multiple), ("base", "基准", base_multiple), ("bull", "乐观", bull_multiple)):
-        value = basis_value * multiple
-        scenarios[key] = {
-            "label": label,
-            "multiple": round(multiple, 2),
-            "basis_value": round(basis_value, 4),
-            "value": round(value, 2),
-            "upside_pct": round((value / current_price - 1) * 100, 1),
-        }
-
-    required_basis_value = current_price / base_multiple
-    current_price_implied_basis = {
-        "available": True,
-        "multiple": round(base_multiple, 2),
-        "required_basis_value": round(required_basis_value, 4),
-        "multiple_of_current_basis": round(required_basis_value / basis_value, 2),
-        "required_growth_pct": round((required_basis_value / basis_value - 1.0) * 100.0, 1),
-    }
-
-    return {
-        "available": True,
-        "method": f"{basis_label} × {multiple_name} historical percentile",
-        "basis": basis,
-        "horizon": horizon,
-        "current_price": round(current_price, 2),
-        "current_multiple": round(current_multiple, 2),
-        "valuation_percentile": round(_numeric(trend.get("valuation_percentile")) or 0.0, 1),
-        "valuation_type": int(valuation_type),
-        "multiple_name": multiple_name,
-        "basis_label": basis_label,
-        "basis_short": basis_short,
-        "basis_value": round(basis_value, 4),
-        "basis_derivation": basis_derivation,
-        "basis_source_period": basis_source[0][0],
-        "eps_ttm": round(basis_value, 4) if int(valuation_type) == 1 else None,
-        "eps_source_period": basis_source[0][0] if int(valuation_type) == 1 else None,
-        "lookback_years": lookback_years,
-        "multiple_sample_size": len(multiple_values),
-        "pe_sample_size": len(multiple_values) if int(valuation_type) == 1 else None,
-        "scenarios": scenarios,
-        "current_price_implied_basis": current_price_implied_basis,
-        "warnings": [
-            "未加入未来盈利增长假设；如需12个月目标价，应另行接入盈利预测或 DCF 假设。",
-            f"已按接口返回的 {multiple_name} 类型计算，未将其强行解释为 PE。",
-            f"财务基准来源：{basis_derivation}。",
-        ],
-    }
+def normalize_security(raw: str) -> tuple[str, str, bool]:
+    value = str(raw).strip().upper()
+    if value.startswith(("SH.", "SZ.")):
+        digits = value.split(".", 1)[1]
+        return digits, value, True
+    if value.startswith("US.") or value.startswith("HK."):
+        return value.split(".", 1)[1], value, False
+    if len(value) == 5 and value.isdigit():
+        return value, f"HK.{value}", False
+    digits = normalize_code(value)
+    if len(digits) == 6 and digits.isdigit():
+        market = "SH" if digits.startswith(("5", "6", "9")) else "SZ"
+        return digits, f"{market}.{digits}", True
+    return value, f"US.{value}", False
 
 
-def _data_rows(section: Any) -> list[dict[str, Any]]:
-    if not isinstance(section, dict):
+def dataframe_records(frame: pd.DataFrame | None) -> list[dict[str, Any]]:
+    if frame is None or frame.empty:
         return []
-    data = section.get("data", section)
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if isinstance(data, dict):
-        rows = data.get("rows")
-        if isinstance(rows, list):
-            return [item for item in rows if isinstance(item, dict)]
-        return [data] if "last_price" in data else []
-    return []
+    return json.loads(frame.to_json(orient="records", force_ascii=False, date_format="iso"))
 
 
-def enrich_ticker_name(ticker: dict[str, str], evidence: dict[str, Any]) -> dict[str, str]:
-    """Prefer the issuer name returned by the market evidence over the code."""
-    enriched = dict(ticker)
-    candidates: list[Any] = []
-    evidence_ticker = evidence.get("ticker")
-    if isinstance(evidence_ticker, dict):
-        candidates.append(evidence_ticker.get("name"))
-    snapshot_rows = _data_rows(evidence.get("snapshot"))
-    if snapshot_rows:
-        candidates.append(snapshot_rows[0].get("name"))
-    for candidate in candidates:
-        name = str(candidate or "").strip()
-        if name and name not in {ticker.get("code"), ticker.get("name"), ticker.get("input")}:
-            enriched["name"] = name
-            break
-    return enriched
-
-
-def _numeric(value: Any) -> float | None:
-    if isinstance(value, bool):
+def safe_call(name: str, call: Callable[[], Any], warnings: list[str]) -> Any:
+    try:
+        return call()
+    except Exception as exc:  # Endpoint coverage varies by market and account.
+        warnings.append(f"{name}: {type(exc).__name__}: {exc}")
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+
+
+def ashare_usage_path(today: dt.date | None = None) -> Path:
+    usage_date = today or dt.date.today()
+    return ROOT / ".runtime" / "asharehub_usage" / f"{usage_date:%Y%m%d}.json"
+
+
+def load_ashare_usage(path: Path) -> int:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return max(int(payload.get("attempted_calls", 0)), 0)
+    except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def record_ashare_call(path: Path) -> int:
+    used = load_ashare_usage(path) + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "date": path.stem,
+                "attempted_calls": used,
+                "documented_daily_limit": ASHARE_DAILY_LIMIT,
+                "updated_at": dt.datetime.now().astimezone().isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return used
+
+
+def ashare_cache_path(symbol: str, as_of: str, profile: str) -> Path:
+    safe_symbol = symbol.replace(".", "_")
+    return ROOT / ".runtime" / "deep_research_cache" / as_of.replace("-", "") / f"{safe_symbol}_{profile}.json"
+
+
+def collect_futu(
+    futu_code: str,
+    *,
+    host: str,
+    port: int,
+    start: str,
+    end: str,
+) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    prepare_futu_runtime(ROOT)
+    client: FutuClient | None = None
+    output: dict[str, Any] = {}
+    try:
+        client = FutuClient(host=host, port=port, max_rate_limit_retries=1)
+        snapshot = safe_call("futu.market_snapshot", lambda: client.market_snapshot([futu_code]), warnings)
+        output["market_snapshot"] = dataframe_records(snapshot)
+        output["capital_flow_summary"] = safe_call(
+            "futu.capital_flow_summary",
+            lambda: client.capital_flow_summary(futu_code, start=start, end=end),
+            warnings,
+        )
+        output["capital_distribution"] = dataframe_records(
+            payload_frame(
+                safe_call(
+                    "futu.get_capital_distribution",
+                    lambda: client._call("get_capital_distribution", futu_code, required=False),
+                    warnings,
+                )
+            )
+        )
+        output["valuation_detail"] = safe_call(
+            "futu.valuation_detail", lambda: client.valuation_detail(futu_code), warnings
+        )
+        output["owner_plate"] = dataframe_records(
+            safe_call("futu.owner_plate", lambda: client.owner_plate([futu_code]), warnings)
+        )
+        output["financial_statements"] = dataframe_records(
+            payload_frame(
+                safe_call(
+                    "futu.get_financials_statements",
+                    lambda: client._call("get_financials_statements", futu_code, num=10, required=False),
+                    warnings,
+                )
+            )
+        )
+        output["revenue_breakdown"] = dataframe_records(
+            payload_frame(
+                safe_call(
+                    "futu.get_financials_revenue_breakdown",
+                    lambda: client._call("get_financials_revenue_breakdown", futu_code, required=False),
+                    warnings,
+                )
+            )
+        )
+        output["company_profile"] = dataframe_records(
+            payload_frame(
+                safe_call(
+                    "futu.get_company_profile",
+                    lambda: client._call("get_company_profile", futu_code, required=False),
+                    warnings,
+                )
+            )
+        )
+        output["corporate_actions"] = safe_call(
+            "futu.corporate_action_flags", lambda: client.corporate_action_flags(futu_code), warnings
+        )
+        output["event_context"] = safe_call(
+            "futu.event_context", lambda: client.event_context(futu_code), warnings
+        )
+        warnings.extend(client.warnings)
+    except FutuUnavailable as exc:
+        warnings.append(f"futu.connection: {exc}")
+    except Exception as exc:
+        warnings.append(f"futu.connection: {type(exc).__name__}: {exc}")
+    finally:
+        if client is not None:
+            client.close()
+    return output, list(dict.fromkeys(warnings))
+
+
+def collect_asharehub(
+    symbol: str,
+    *,
+    as_of: str,
+    profile: str,
+    max_calls: int,
+    usage_path: Path,
+    refresh: bool = False,
+) -> tuple[dict[str, Any], list[str], int]:
+    warnings: list[str] = []
+    cache_path = ashare_cache_path(symbol, as_of, profile)
+    if not refresh and cache_path.exists():
         try:
-            return float(value.replace(",", "").strip())
-        except ValueError:
-            return None
-    return None
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            return cached["data"], ["asharehub: reused same-cutoff cache; API calls=0"], 0
+        except (KeyError, TypeError, json.JSONDecodeError):
+            warnings.append("asharehub: ignored invalid local cache")
+    key = os.environ.get("ASHAREHUB_API_KEY")
+    if not key:
+        machine_key = None
+        if os.name == "nt":
+            try:
+                import winreg
+
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as reg:
+                    machine_key, _ = winreg.QueryValueEx(reg, "ASHAREHUB_API_KEY")
+            except OSError:
+                machine_key = None
+        key = machine_key
+    if not key:
+        return {}, ["asharehub: ASHAREHUB_API_KEY is unavailable"], 0
+
+    from asharehub import AShareHub
+
+    client = AShareHub(api_key=key)
+    output: dict[str, Any] = {}
+    cutoff = as_of.replace("-", "")
+    endpoint_names = ASHARE_CORE_ENDPOINTS if profile == "core" else tuple(ASHARE_ENDPOINTS)
+    endpoint_items = [(name, ASHARE_ENDPOINTS[name]) for name in endpoint_names]
+    calls = 0
+    for index, (label, (method_name, start_date)) in enumerate(endpoint_items):
+        if calls >= max_calls:
+            for remaining_label, _ in endpoint_items[index:]:
+                output[remaining_label] = []
+            warnings.append(f"asharehub: invocation/daily budget reached after {calls} calls; remaining endpoints skipped")
+            break
+        status_code = None
+        method = getattr(client, method_name)
+        kwargs: dict[str, Any] = {"symbol": symbol}
+        if start_date:
+            kwargs["start_date"] = start_date
+        try:
+            record_ashare_call(usage_path)
+            calls += 1
+            frame = method(**kwargs)
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            warnings.append(f"asharehub.{method_name}: {type(exc).__name__}: {exc}")
+            frame = None
+            if status_code == 429:
+                for remaining_label, _ in endpoint_items[index + 1 :]:
+                    output[remaining_label] = []
+                warnings.append("asharehub: quota exhausted; remaining endpoints were not called")
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            for date_field in ("ann_date", "f_ann_date", "trade_date"):
+                if date_field in frame.columns:
+                    values = frame[date_field].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
+                    frame = frame.loc[values <= cutoff].copy()
+                    break
+        if frame is None:
+            output[label] = []
+            if not any(item.startswith(f"asharehub.{method_name}:") for item in warnings):
+                warnings.append(f"asharehub.{method_name}: returned no data object")
+        else:
+            output[label] = dataframe_records(frame) if isinstance(frame, pd.DataFrame) else frame
+        if status_code == 429:
+            break
+    cacheable = len(output) == len(endpoint_items) and not any(
+        item.startswith("asharehub.") or "quota" in item or "budget" in item for item in warnings
+    )
+    if cacheable:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(
+            cache_path,
+            {
+                "symbol": symbol,
+                "as_of": as_of,
+                "profile": profile,
+                "retrieved_at": dt.datetime.now().astimezone().isoformat(),
+                "data": output,
+            },
+        )
+    return output, warnings, calls
 
 
-def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        raise ValueError("percentile requires at least one value")
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * percentile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
-
-
-def derive_research_context(
-    evidence: dict[str, Any],
-    research_score: dict[str, Any],
-    fair_value: dict[str, Any],
-    dcf_valuation: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    """Turn available evidence into explicit, testable catalyst and risk text."""
-    catalyst = evidence.get("catalyst", {})
-    catalyst_rows = catalyst.get("rows", []) if isinstance(catalyst, dict) else []
-    rows = [row for row in catalyst_rows if isinstance(row, dict)]
-    event_scores = [_numeric(row.get("event_score")) for row in rows]
-    catalyst_scores = [_numeric(row.get("catalyst_score")) for row in rows]
-    event_score = max((value for value in event_scores if value is not None), default=None)
-    catalyst_score = max((value for value in catalyst_scores if value is not None), default=None)
-
-    flow_rows = []
-    technical = evidence.get("technical_flow", {})
-    if isinstance(technical, dict):
-        flow = technical.get("capital_flow", {})
-        flow_rows = flow.get("data", []) if isinstance(flow, dict) else []
-    flow_rows = [row for row in flow_rows if isinstance(row, dict)]
-    flow_10d = _first_numeric(flow_rows, "flow_net_10d")
-    flow_20d = _first_numeric(flow_rows, "flow_net_20d")
-    flow_positive = flow_10d is not None and flow_20d is not None and flow_10d > 0 and flow_20d > 0
-
-    if event_score is not None or catalyst_score is not None:
-        catalyst_text = "下一事件窗口：下一期财报/业绩预告（证据包未提供具体日期）"
-        checks = ["验证盈利增长是否延续"]
-        if flow_positive:
-            checks.append("验证10日、20日主力净流入是否继续为正")
-        if event_score is not None:
-            checks.append(f"当前事件评分 {event_score:.1f}")
-        if catalyst_score is not None:
-            checks.append(f"催化评分 {catalyst_score:.1f}")
-        next_catalyst = catalyst_text + "；" + "，".join(checks) + "。"
-    else:
-        next_catalyst = "未采集到带日期的公司事件；需补充公告日历或下一期业绩披露日期。"
-
-    risk_parts: list[str] = []
-    if fair_value.get("available"):
-        base = fair_value.get("scenarios", {}).get("base", {})
-        base_upside = _numeric(base.get("upside_pct"))
-        if base_upside is not None and base_upside <= 5:
-            risk_parts.append(f"基准合理价值较现价仅{base_upside:+.1f}%")
-    dcf_valuation = dcf_valuation or {}
-    if dcf_valuation.get("available"):
-        dcf_upside = _numeric(dcf_valuation.get("scenarios", {}).get("base", {}).get("upside_pct"))
-        if dcf_upside is not None and dcf_upside <= 5:
-            dcf_label = "DCF基准目标价" if dcf_valuation.get("decision_usable", True) else "DCF基准现金流底值"
-            risk_parts.append(f"{dcf_label}较现价{dcf_upside:+.1f}%")
-
-    margin_yoy, cash_yoy = _latest_quality_changes(evidence)
-    if margin_yoy is not None and margin_yoy < 0:
-        risk_parts.append(f"最新销售净利率同比{margin_yoy:+.1f}%")
-    if cash_yoy is not None and cash_yoy < 0:
-        risk_parts.append(f"净利润现金含量同比{cash_yoy:+.1f}%")
-    if flow_positive:
-        risk_parts.append("资金流正向但需观察持续性")
-    key_risk = "；".join(risk_parts) + "。" if risk_parts else _default_key_risk(research_score)
-
-    invalidation_parts = ["下一期 EPS/扣非利润同比转负或明显低于预期"]
-    if margin_yoy is not None or cash_yoy is not None:
-        invalidation_parts.append("利润率或经营现金含量继续恶化")
-    if flow_positive:
-        invalidation_parts.append("10日、20日主力净流入同时转负")
-    invalidation_parts.append("估值评分跌破35或关键证据补齐后仍无法支撑当前结论")
-    return {
-        "next_catalyst": next_catalyst,
-        "key_risk": key_risk,
-        "primary_invalidation": "；".join(invalidation_parts) + "。",
-    }
-
-
-def _first_numeric(rows: list[dict[str, Any]], key: str) -> float | None:
-    for row in rows:
-        value = _numeric(row.get(key))
-        if value is not None:
-            return value
-    return None
-
-
-def _latest_quality_changes(evidence: dict[str, Any]) -> tuple[float | None, float | None]:
-    financials = evidence.get("financial_quality", {})
-    if isinstance(financials, dict):
-        financials = financials.get("financials", financials)
-    if not isinstance(financials, dict):
-        return None, None
-    data = financials.get("data", financials)
-    reports = data.get("report_list", []) if isinstance(data, dict) else []
-    if not isinstance(reports, list) or not reports:
-        return None, None
-    reports = sorted(
-        [report for report in reports if isinstance(report, dict)],
-        key=lambda report: str(report.get("date_time_str", "")),
+def _model_json_candidates(as_of: str) -> list[Path]:
+    cutoff = as_of.replace("-", "")[:8]
+    output_root = ROOT.parent / "outputs" / "deep_research"
+    if not output_root.is_dir():
+        return []
+    date_dirs = sorted(
+        (
+            path
+            for path in output_root.iterdir()
+            if path.is_dir() and re.fullmatch(r"\d{8}", path.name) and path.name <= cutoff
+        ),
+        key=lambda path: path.name,
         reverse=True,
     )
-    items = reports[0].get("item_list", [])
-    margin_yoy = None
-    cash_yoy = None
-    for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("display_name", ""))
-        if name == "销售净利率":
-            margin_yoy = _numeric(item.get("yoy"))
-        elif name == "净利润现金含量":
-            cash_yoy = _numeric(item.get("yoy"))
-    return margin_yoy, cash_yoy
-
-
-def safe_dir_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", value).strip("_") or "stock"
-
-
-def write_multi_stock_outputs(results: list[dict[str, Any]], output_root: Path, as_of: date) -> None:
-    if len(results) <= 1:
-        return
-    date_dir = output_root / as_of.strftime("%Y%m%d")
-    summary_path = date_dir / "deep_research_summary.csv"
-    fields = ["code", "industry", "research_posture", "confidence", "score", "position_band", "output_dir"]
-    with summary_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        for item in results:
-            score = item["research_score"]
-            writer.writerow(
-                {
-                    "code": item["code"],
-                    "industry": item.get("industry") or "unknown",
-                    "research_posture": score["posture"],
-                    "confidence": score["confidence"],
-                    "score": score["total_score"],
-                    "position_band": score["position_band"],
-                    "output_dir": item["output_dir"],
-                }
+    candidates: list[Path] = []
+    for date_dir in date_dirs:
+        dated: list[tuple[bool, float, Path]] = []
+        for path in date_dir.glob("model_rows_*.json"):
+            production_name = bool(
+                re.fullmatch(rf"model_rows_{date_dir.name}_\d{{6}}\.json", path.name)
             )
-    industry_counts: dict[str, int] = {}
-    for item in results:
-        industry = str(item.get("industry") or "unknown")
-        industry_counts[industry] = industry_counts.get(industry, 0) + 1
-    top_industry, top_count = max(industry_counts.items(), key=lambda pair: pair[1])
-    concentration = top_count / len(results) * 100.0
-    synthesis = [
-        "# Portfolio Synthesis",
-        "",
-        f"- 股票数量：{len(results)}",
-        f"- 最大行业集中度：{top_industry} {top_count}/{len(results)}（{concentration:.1f}%）",
-        "- 行业分布：" + "，".join(f"{name} {count}" for name, count in sorted(industry_counts.items())),
-        "- 相关性：当前证据包未提供统一日期对齐的全量收益序列，未虚构相关系数；组合建仓前仍需补做相关性与压力测试。",
-        "",
-    ]
-    (date_dir / "portfolio_synthesis.md").write_text("\n".join(synthesis), encoding="utf-8")
-
-
-def append_research_ledger(results: list[dict[str, Any]], output_root: Path, as_of: date) -> None:
-    """Keep an idempotent decision snapshot for later forward-return review."""
-    path = output_root / "research_history.csv"
-    fields = [
-        "as_of", "code", "industry", "posture", "confidence", "score", "position_band",
-        "current_price", "fair_value_base", "dcf_value_base", "output_dir",
-    ]
-    existing: list[dict[str, Any]] = []
-    if path.exists():
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            existing = list(csv.DictReader(handle))
-    keyed = {(row.get("as_of"), row.get("code")): row for row in existing}
-    for item in results:
-        score = item["research_score"]
-        row = {
-            "as_of": as_of.isoformat(), "code": item["code"], "industry": item.get("industry") or "unknown",
-            "posture": score["posture"], "confidence": score["confidence"], "score": score["total_score"],
-            "position_band": score["position_band"], "current_price": item.get("current_price"),
-            "fair_value_base": item.get("fair_value_base"), "dcf_value_base": item.get("dcf_value_base"),
-            "output_dir": item["output_dir"],
-        }
-        keyed[(row["as_of"], row["code"])] = row
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(sorted(keyed.values(), key=lambda row: (str(row.get("as_of")), str(row.get("code")))))
-
-
-def _evidence_industry(evidence: dict[str, Any]) -> str:
-    for section_name in ("model", "catalyst"):
-        section = evidence.get(section_name)
-        rows = section.get("rows", []) if isinstance(section, dict) else []
-        for row in rows if isinstance(rows, list) else []:
-            if isinstance(row, dict) and row.get("industry"):
-                return str(row["industry"])
-    return str(evidence.get("industry") or "unknown")
-
-
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect deterministic evidence scaffolds for deep stock research.")
-    parser.add_argument("codes", nargs="+", help="A-share, Hong Kong, or US tickers to research.")
-    parser.add_argument("--output-root", type=Path, default=Path("outputs/deep_research"))
-    parser.add_argument("--as-of", default=date.today().isoformat(), help="Research cutoff date, YYYY-MM-DD.")
-    parser.add_argument("--horizon", default="MEDIUM", choices=["SHORT", "MEDIUM", "LONG"])
-    parser.add_argument("--language", default="zh-CN", choices=["zh-CN", "en"])
-    parser.add_argument("--risk-profile", default="平衡", choices=["保守", "平衡", "激进"])
-    parser.add_argument("--investment-style", default="未指定")
-    parser.add_argument("--research-depth", default="标准尽调")
-    parser.add_argument("--evidence-json", type=Path, help="Optional JSON evidence map keyed by normalized code.")
-    parser.add_argument("--model-output", type=Path, help="Reserved for saved model output ingestion.")
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
-    as_of = date.fromisoformat(args.as_of)
-    all_evidence = load_evidence(args.evidence_json)
-    results: list[dict[str, Any]] = []
-
-    for code in args.codes:
-        ticker = normalize_ticker(code)
-        evidence = select_evidence(all_evidence, ticker)
-        if args.model_output:
-            evidence = merge_model_output(evidence, args.model_output, ticker)
-        results.append(
-            write_bundle(
-                ticker,
-                evidence,
-                args.output_root,
-                as_of,
-                args.horizon,
-                args.language,
-                args.risk_profile,
-                args.investment_style,
-                args.research_depth,
-            )
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            dated.append((production_name, modified, path))
+        candidates.extend(
+            item[2]
+            for item in sorted(dated, key=lambda item: (item[0], item[1], item[2].name), reverse=True)
         )
-
-    write_multi_stock_outputs(results, args.output_root, as_of)
-    append_research_ledger(results, args.output_root, as_of)
-    for item in results:
-        score = item["research_score"]
-        print(f"{item['code']}: {score['posture']} score={score['total_score']} position={score['position_band']}")
-        print(f"  output: {item['output_dir']}")
-    return 0
+    return candidates
 
 
-def merge_model_output(evidence: dict[str, Any], path: Path, ticker: dict[str, str]) -> dict[str, Any]:
-    if not path.exists():
-        merged = dict(evidence)
-        merged.setdefault("warnings", []).append(f"Model output not found: {path}")
-        return merged
+def _load_model_json(code: str, *, as_of: str) -> tuple[list[dict[str, Any]], Path | None]:
+    normalized_code = normalize_code(code)
+    for path in _model_json_candidates(as_of):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        source_rows = payload.get(normalized_code)
+        if not isinstance(source_rows, list) or not source_rows:
+            continue
 
-    if path.suffix.lower() == ".json":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        selected = select_evidence(data if isinstance(data, dict) else {}, ticker)
-        if selected:
-            merged = dict(evidence)
-            merged["model"] = selected.get("model", selected)
-            return merged
+        output: list[dict[str, Any]] = []
+        for source_row in source_rows:
+            if not isinstance(source_row, dict):
+                continue
+            row = dict(source_row)
+            model_name = str(row.get("model_name") or row.get("model_slug") or "").strip()
+            peers = [
+                peer
+                for values in payload.values()
+                if isinstance(values, list)
+                for peer in values
+                if isinstance(peer, dict)
+                and str(peer.get("model_name") or peer.get("model_slug") or "").strip() == model_name
+            ]
+            peers.sort(
+                key=lambda peer: float(peer.get("total_score") or float("-inf")),
+                reverse=True,
+            )
+            rank = next(
+                (
+                    index
+                    for index, peer in enumerate(peers, 1)
+                    if normalize_code(peer.get("code")) == normalized_code
+                ),
+                None,
+            )
+            row.setdefault("model_slug", model_name)
+            row.setdefault("prediction_date", f"{path.parent.name[:4]}-{path.parent.name[4:6]}-{path.parent.name[6:8]}")
+            row["rank"] = rank
+            row["universe_size"] = len(peers)
+            row["model_source_file"] = str(path)
+            output.append(row)
+        if output:
+            return output, path
+    return [], None
 
-    merged = dict(evidence)
-    merged.setdefault("warnings", []).append(f"Unsupported or unmatched model output: {path}")
-    return merged
+
+def load_model_evidence(code: str, db_path: Path, *, as_of: str) -> tuple[list[dict[str, Any]], list[str]]:
+    sqlite_error: str | None = None
+    if not db_path.exists():
+        sqlite_error = f"database not found: {db_path}"
+    else:
+        query = """
+            SELECT prediction_date, model_slug, name, rank, bucket, total_score,
+                   rotation_state, research_posture, selection_reason, risk_flags,
+                   feature_json, run_id
+            FROM model_predictions
+            WHERE code = ? AND prediction_date <= ?
+            ORDER BY prediction_date DESC, model_slug, rank
+        """
+        try:
+            with sqlite3.connect(db_path) as conn:
+                frame = pd.read_sql_query(query, conn, params=(code, as_of))
+            rows = dataframe_records(frame)
+            if rows:
+                return rows, []
+            sqlite_error = f"no SQLite rows for {code} through {as_of}"
+        except Exception as exc:
+            sqlite_error = f"{type(exc).__name__}: {exc}"
+
+    fallback_rows, fallback_path = _load_model_json(code, as_of=as_of)
+    if fallback_rows:
+        return fallback_rows, []
+    return [], [
+        f"model_ledger: {sqlite_error}; no model_rows JSON fallback found for {code} through {as_of}"
+    ]
 
 
-def _component_score(value: Any) -> float | None:
-    if value is None:
+def price_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {}
+    frame = pd.DataFrame(rows)
+    close_column = "close" if "close" in frame else "close_qfq" if "close_qfq" in frame else None
+    date_column = "trade_date" if "trade_date" in frame else "time_key" if "time_key" in frame else None
+    if close_column is None:
+        return {}
+    frame[close_column] = pd.to_numeric(frame[close_column], errors="coerce")
+    frame = frame.dropna(subset=[close_column])
+    if date_column:
+        frame = frame.sort_values(date_column)
+    if frame.empty:
+        return {}
+    close = frame[close_column].astype(float)
+    result: dict[str, Any] = {"close": float(close.iloc[-1])}
+    if date_column:
+        result["date"] = str(frame.iloc[-1][date_column])[:10]
+    for days in (5, 10, 20, 60):
+        if len(close) > days:
+            result[f"return_{days}d_pct"] = (float(close.iloc[-1] / close.iloc[-days - 1]) - 1.0) * 100.0
+    returns = close.pct_change()
+    for days in (20, 60):
+        sample = returns.tail(days).dropna()
+        if len(sample) >= max(5, days // 2):
+            result[f"annualized_vol_{days}d_pct"] = float(sample.std(ddof=1) * math.sqrt(252) * 100.0)
+    tail = close.tail(60)
+    if len(tail) >= 2:
+        drawdown = tail / tail.cummax() - 1.0
+        result["max_drawdown_60d_pct"] = float(drawdown.min() * 100.0)
+    return result
+
+
+def latest_row(rows: list[dict[str, Any]], date_field: str) -> dict[str, Any]:
+    valid = [row for row in rows if row.get(date_field) is not None]
+    return max(valid, key=lambda row: str(row[date_field])) if valid else {}
+
+
+def resolve_stock_name(
+    code: str,
+    futu_data: dict[str, Any],
+    ashare_data: dict[str, Any],
+    model_rows: list[dict[str, Any]],
+) -> str:
+    candidates = [
+        ((futu_data.get("market_snapshot") or [{}])[0]).get("name"),
+        ((ashare_data.get("stock") or [{}])[0]).get("name"),
+        ((ashare_data.get("stock") or [{}])[0]).get("stock_name"),
+        (model_rows[0] if model_rows else {}).get("name"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value.lower() not in {"nan", "none"}:
+            return value
+    return code
+
+
+def safe_directory_name(value: str, fallback: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value)).strip().rstrip(".")
+    return cleaned or fallback
+
+
+def positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
         return None
-    if isinstance(value, (int, float)):
-        return _clamp(float(value))
-    if isinstance(value, dict):
-        for key in ("score", "total_score", "confidence_score"):
-            if isinstance(value.get(key), (int, float)):
-                return _clamp(float(value[key]))
-    return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
-def _confidence(component_scores: dict[str, float], unavailable: list[str]) -> str:
-    data_score = component_scores.get("data_confidence", 0.0)
-    if data_score >= 80 and len(unavailable) <= 1:
-        return "HIGH"
-    if data_score >= 60 and len(unavailable) <= 2:
-        return "MEDIUM"
-    return "LOW"
+def percentile(values: list[float], quantile: float) -> float:
+    return float(pd.Series(values, dtype=float).quantile(quantile, interpolation="linear"))
 
 
-def _clamp(value: float) -> float:
-    return max(0.0, min(100.0, round(value, 2)))
+def derive_relative_valuation(
+    raw: dict[str, Any],
+    *,
+    price: dict[str, Any],
+    fundamentals: dict[str, Any],
+    indicators: dict[str, Any],
+    futu_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Estimate a traceable value range from historical PE/PB percentiles.
+
+    The method deliberately makes no forward earnings forecast. It converts
+    same-date valuation multiples back into per-share fundamentals, then
+    applies the available historical 25th/50th/75th percentile multiples.
+    """
+    ashare = raw.get("asharehub", {})
+    rows = ashare.get("fundamentals", []) or []
+    current_price = positive_number(price.get("close")) or positive_number(fundamentals.get("close"))
+    if current_price is None:
+        current_price = positive_number(futu_snapshot.get("latest_price"))
+    if current_price is None:
+        return {"available": False, "reason": "缺少同一截止日的当前股价"}
+
+    methods: dict[str, dict[str, Any]] = {}
+    current_pe = positive_number(fundamentals.get("pe_ttm")) or positive_number(futu_snapshot.get("pe_dynamic"))
+    pe_values = [
+        number
+        for row in rows
+        if (number := positive_number(row.get("pe_ttm"))) is not None and 2.0 <= number <= 120.0
+    ]
+    if current_pe is not None and len(pe_values) >= 60:
+        eps_ttm = current_price / current_pe
+        pe_multiples = {
+            "bear": percentile(pe_values, 0.25),
+            "base": percentile(pe_values, 0.50),
+            "bull": percentile(pe_values, 0.75),
+        }
+        methods["pe"] = {
+            "label": "PE TTM 历史分位",
+            "basis_label": "隐含 TTM EPS",
+            "basis_value": eps_ttm,
+            "basis_derivation": "当前股价 ÷ 同日 PE TTM",
+            "current_multiple": current_pe,
+            "sample_size": len(pe_values),
+            "multiples": pe_multiples,
+            "values": {key: eps_ttm * multiple for key, multiple in pe_multiples.items()},
+        }
+
+    current_pb = positive_number(fundamentals.get("pb")) or positive_number(futu_snapshot.get("pb"))
+    pb_values = [
+        number
+        for row in rows
+        if (number := positive_number(row.get("pb"))) is not None and 0.1 <= number <= 20.0
+    ]
+    bps = positive_number(indicators.get("bps"))
+    if current_pb is not None:
+        implied_bps = current_price / current_pb
+        if bps is None or abs(bps - implied_bps) / implied_bps > 0.25:
+            bps = implied_bps
+            bps_derivation = "当前股价 ÷ 同日 PB"
+        else:
+            bps_derivation = f"最新财务指标 BPS（报告期 {indicators.get('end_date', '不可用')}）"
+    else:
+        bps_derivation = "不可用"
+    if current_pb is not None and bps is not None and len(pb_values) >= 60:
+        pb_multiples = {
+            "bear": percentile(pb_values, 0.25),
+            "base": percentile(pb_values, 0.50),
+            "bull": percentile(pb_values, 0.75),
+        }
+        methods["pb"] = {
+            "label": "PB 历史分位",
+            "basis_label": "每股净资产",
+            "basis_value": bps,
+            "basis_derivation": bps_derivation,
+            "current_multiple": current_pb,
+            "sample_size": len(pb_values),
+            "multiples": pb_multiples,
+            "values": {key: bps * multiple for key, multiple in pb_multiples.items()},
+        }
+
+    if not methods:
+        return {
+            "available": False,
+            "reason": "有效 PE/PB、每股财务基准或历史估值样本不足（至少需要 60 个交易日）",
+        }
+
+    weight = 1.0 / len(methods)
+    for method in methods.values():
+        method["weight"] = weight
+    scenarios: dict[str, dict[str, Any]] = {}
+    for key, label in (("bear", "保守"), ("base", "基准"), ("bull", "乐观")):
+        value = sum(method["values"][key] * method["weight"] for method in methods.values())
+        scenarios[key] = {
+            "label": label,
+            "value": round(value, 2),
+            "upside_pct": round((value / current_price - 1.0) * 100.0, 1),
+        }
+
+    trade_dates = sorted(str(row.get("trade_date")) for row in rows if row.get("trade_date"))
+    metadata = raw.get("metadata", {})
+    return {
+        "available": True,
+        "label": "分析估算价值",
+        "method": "PE TTM 与 PB 历史分位等权综合" if len(methods) == 2 else next(iter(methods.values()))["label"],
+        "valuation_date": metadata.get("as_of") or price.get("date"),
+        "currency": "CNY" if str(metadata.get("futu_code", "")).startswith(("SH.", "SZ.")) else "",
+        "current_price": round(current_price, 2),
+        "reasonable_value_range": [scenarios["bear"]["value"], scenarios["bull"]["value"]],
+        "scenarios": scenarios,
+        "methods": methods,
+        "sample_period": {
+            "start": trade_dates[0] if trade_dates else None,
+            "end": trade_dates[-1] if trade_dates else None,
+        },
+        "confidence": "中等" if len(methods) == 2 else "偏低",
+        "warnings": [
+            "这是基于历史估值分位的分析估算价值，不是券商一致目标价或收益承诺。",
+            "未加入未来盈利增长预测；周期股还需结合商品价格与利润周期判断。",
+        ],
+    }
 
 
-def _field(evidence: dict[str, Any], section: str, key: str) -> Any:
-    value = evidence.get(section)
-    if isinstance(value, dict):
-        return value.get(key)
-    return None
+def derive(raw: dict[str, Any]) -> dict[str, Any]:
+    futu = raw.get("futu", {})
+    ashare = raw.get("asharehub", {})
+    prices = raw.get("market_history", []) or ashare.get("technical_factors") or ashare.get("market_daily") or []
+    model_rows = raw.get("model_evidence", [])
+    price = price_metrics(prices)
+    futu_snapshot = (futu.get("market_snapshot") or [{}])[0]
+    fundamentals = latest_row(ashare.get("fundamentals", []), "trade_date")
+    indicators = latest_row(ashare.get("financial_indicators", []), "end_date")
+    result = {
+        "price": price,
+        "latest_futu_snapshot": futu_snapshot,
+        "futu_flow": futu.get("capital_flow_summary") or {},
+        "futu_valuation": futu.get("valuation_detail") or {},
+        "latest_ashare_fundamentals": fundamentals,
+        "latest_financial_indicators": indicators,
+        "latest_disclosure_plan": latest_row(ashare.get("disclosure_date", []), "end_date"),
+        "latest_margin": latest_row(ashare.get("margin", []), "trade_date"),
+        "latest_chips": latest_row(ashare.get("chip_distribution", []), "trade_date"),
+        "latest_model_selection": model_rows[0] if model_rows else {},
+        "model_selection_count": len(model_rows),
+    }
+    result["fair_value"] = derive_relative_valuation(
+        raw,
+        price=price,
+        fundamentals=fundamentals,
+        indicators=indicators,
+        futu_snapshot=futu_snapshot,
+    )
+    return result
 
 
-def _default_key_risk(score: dict[str, Any]) -> str:
-    if score["unavailable_components"]:
-        return "关键证据缺失导致结论置信度受限"
-    if score["hard_limits"]:
-        return "硬性风险限制触发，需先排除风险事项"
-    return "基本面、估值、资金流或催化剂出现与当前结论相反的新证据"
+def fmt(value: Any, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "不可用"
+    if not math.isfinite(number):
+        return "不可用"
+    return f"{number:,.{digits}f}"
 
 
-def _default_invalidation(score: dict[str, Any]) -> str:
-    if score["posture"] == "CORE CANDIDATE":
-        return "财务质量或资金流评分跌破60，或治理风险评分跌破45"
-    if score["posture"] == "TIMING WATCH":
-        return "技术/资金流无法改善且催化剂落空"
-    if score["posture"] == "EVENT CANDIDATE":
-        return "催化剂日期后未出现基本面或资金确认"
-    return "补齐关键证据后仍无法支撑最低研究阈值"
+def render_brief(code: str, futu_code: str, as_of: str, derived: dict[str, Any], warnings: list[str], language: str) -> str:
+    price = derived.get("price", {})
+    fundamentals = derived.get("latest_ashare_fundamentals", {})
+    futu_snapshot = derived.get("latest_futu_snapshot", {})
+    pe_ttm = fundamentals.get("pe_ttm", futu_snapshot.get("pe_dynamic"))
+    pb = fundamentals.get("pb", futu_snapshot.get("pb"))
+    indicator = derived.get("latest_financial_indicators", {})
+    model = derived.get("latest_model_selection", {})
+    plan = derived.get("latest_disclosure_plan", {})
+    model_name = model.get("model_slug") or model.get("model_name") or "不可用"
+    rank = model.get("rank")
+    universe_size = model.get("universe_size")
+    rank_text = f"{rank}/{universe_size}" if rank is not None and universe_size else rank or "不可用"
+    fair_value = derived.get("fair_value", {})
+    if language == "en":
+        fair_value_text = (
+            f"- Analysis-estimated value (bear/base/bull): {fmt(fair_value['scenarios']['bear']['value'])} / "
+            f"{fmt(fair_value['scenarios']['base']['value'])} / {fmt(fair_value['scenarios']['bull']['value'])}\n"
+            if fair_value.get("available")
+            else f"- Analysis-estimated value: Unavailable ({fair_value.get('reason', 'insufficient inputs')})\n"
+        )
+        return (
+            f"# Deep-research data brief: {futu_code}\n\n"
+            f"Data cutoff: {as_of}\n\n"
+            f"- Close: {fmt(price.get('close'))}\n"
+            f"- 20-day return: {fmt(price.get('return_20d_pct'))}%\n"
+            f"- PE TTM / PB: {fmt(pe_ttm)} / {fmt(pb)}\n"
+            + fair_value_text
+            +
+            f"- Latest model: {model_name}, rank {rank_text}, score {model.get('total_score', 'unavailable')}\n"
+            f"- Next planned disclosure: {plan.get('pre_date', 'unavailable')}\n\n"
+            "## Collection warnings\n\n" + "\n".join(f"- {item}" for item in warnings or ["None"])
+        )
+    if fair_value.get("available"):
+        scenarios = fair_value["scenarios"]
+        methods = fair_value.get("methods", {})
+        method_lines = []
+        for method in methods.values():
+            method_lines.append(
+                f"- {method['label']}：{method['basis_label']} {fmt(method['basis_value'], 4)} × "
+                f"历史25/50/75分位倍数 {fmt(method['multiples']['bear'])} / {fmt(method['multiples']['base'])} / {fmt(method['multiples']['bull'])}，"
+                f"样本 {method['sample_size']} 个交易日，权重 {method['weight'] * 100:.0f}%"
+            )
+        fair_value_text = (
+            "## 分析估算价值（历史相对估值）\n\n"
+            f"- 估值日期：{fair_value.get('valuation_date', as_of)}\n"
+            f"- 当前股价：{fmt(fair_value.get('current_price'))} 元\n"
+            f"- 合理价值区间：{fmt(fair_value['reasonable_value_range'][0])}–{fmt(fair_value['reasonable_value_range'][1])} 元\n"
+            f"- 保守情景：{fmt(scenarios['bear']['value'])} 元，较现价 {scenarios['bear']['upside_pct']:+.1f}%\n"
+            f"- 基准情景：{fmt(scenarios['base']['value'])} 元，较现价 {scenarios['base']['upside_pct']:+.1f}%\n"
+            f"- 乐观情景：{fmt(scenarios['bull']['value'])} 元，较现价 {scenarios['bull']['upside_pct']:+.1f}%\n"
+            f"- 方法：{fair_value['method']}；置信度：{fair_value['confidence']}\n"
+            + "\n".join(method_lines)
+            + "\n- 说明：这是历史估值分位推导的分析估算价值，未加入未来盈利增长，不等同于保证目标价。\n\n"
+        )
+    else:
+        fair_value_text = (
+            "## 分析估算价值（历史相对估值）\n\n"
+            f"- Unavailable：{fair_value.get('reason', '缺少估值输入')}\n\n"
+        )
+    return (
+        f"# 深度研究数据简报：{futu_code}\n\n"
+        f"**数据截止：** {as_of}  \n"
+        "**说明：** 本文件由脚本确定性生成，是后续深度研究的证据底稿，不等同于投资结论。\n\n"
+        "## 行情与估值\n\n"
+        f"- 收盘价：{fmt(price.get('close'))}\n"
+        f"- 5/20/60日收益：{fmt(price.get('return_5d_pct'))}% / {fmt(price.get('return_20d_pct'))}% / {fmt(price.get('return_60d_pct'))}%\n"
+        f"- 20日年化波动率：{fmt(price.get('annualized_vol_20d_pct'))}%\n"
+        f"- 近60日最大回撤：{fmt(price.get('max_drawdown_60d_pct'))}%\n"
+        f"- PE TTM / PB / 股息率TTM：{fmt(pe_ttm)} / {fmt(pb)} / {fmt(fundamentals.get('dv_ttm'))}%\n\n"
+        + fair_value_text
+        +
+        "## 最新财务指标\n\n"
+        f"- 报告期：{indicator.get('end_date', '不可用')}\n"
+        f"- EPS：{fmt(indicator.get('eps'))}\n"
+        f"- ROE：{fmt(indicator.get('roe'))}%\n"
+        f"- 毛利率：{fmt(indicator.get('grossprofit_margin'))}%\n"
+        f"- 归母净利润同比：{fmt(indicator.get('netprofit_yoy'))}%\n"
+        f"- 资产负债率：{fmt(indicator.get('debt_to_assets'))}%\n\n"
+        "## 模型与催化剂\n\n"
+        f"- 最近模型：{model_name}，排名 {rank_text}，得分 {model.get('total_score', '不可用')}\n"
+        f"- 研究姿态：{model.get('research_posture', '不可用')}\n"
+        f"- 建议动作：{model.get('entry_action', '不可用')}\n"
+        f"- 选股理由：{model.get('selection_reason', '不可用')}\n"
+        f"- 预约披露日期：{plan.get('pre_date', '不可用')}\n\n"
+        "## 数据警告\n\n" + "\n".join(f"- {item}" for item in warnings or ["无"])
+    )
 
 
-def _looks_like_single_stock_evidence(data: dict[str, Any]) -> bool:
-    return any(key in data for key in COMPONENTS) or "sources" in data or "warnings" in data
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def main() -> int:
+    args = parse_args()
+    as_of_date = dt.date.fromisoformat(args.as_of)
+    start = args.history_start or (as_of_date - dt.timedelta(days=550)).isoformat()
+    output_root = Path(args.output_dir) if args.output_dir else ROOT / "outputs" / "deep_research" / as_of_date.strftime("%Y%m%d")
+    output_root.mkdir(parents=True, exist_ok=True)
+    usage_file = ashare_usage_path()
+    used_before = load_ashare_usage(usage_file)
+    reserve = min(max(args.asharehub_daily_reserve, 0), ASHARE_DAILY_LIMIT)
+    daily_available = max(ASHARE_DAILY_LIMIT - reserve - used_before, 0)
+    run_remaining = min(max(args.asharehub_budget, 0), daily_available)
+    failures = 0
+
+    for raw_code in args.codes:
+        code, futu_code, is_a_share = normalize_security(raw_code)
+        warnings: list[str] = []
+        futu_data: dict[str, Any] = {}
+        ashare_data: dict[str, Any] = {}
+        market_history: list[dict[str, Any]] = []
+        ashare_calls = 0
+        # Collect HTTP data before starting Futu's socket/background-thread
+        # runtime. Some Windows SDK builds are unstable when lengthy HTTP work
+        # follows quote-context shutdown in the same process.
+        if is_a_share and not args.skip_asharehub:
+            exchange = futu_code.split(".", 1)[0]
+            ashare_data, ashare_warnings, ashare_calls = collect_asharehub(
+                f"{code}.{exchange}",
+                as_of=args.as_of,
+                profile=args.asharehub_profile,
+                max_calls=run_remaining,
+                usage_path=usage_file,
+                refresh=args.refresh_asharehub,
+            )
+            run_remaining = max(run_remaining - ashare_calls, 0)
+            warnings.extend(ashare_warnings)
+        elif not is_a_share and not args.skip_asharehub:
+            warnings.append("asharehub: skipped because the security is not an A-share")
+        if is_a_share:
+            history_frame, history_warnings = fetch_a_share_history(
+                code,
+                start=start,
+                end=args.as_of,
+                adjust="qfq",
+            )
+            market_history = dataframe_records(history_frame)
+            warnings.extend(history_warnings)
+            if not market_history:
+                warnings.append("market_history: all non-Futu A-share history sources failed")
+        else:
+            warnings.append("market_history: non-Futu history fallback is currently available for A-shares only")
+        if not args.skip_futu:
+            futu_data, futu_warnings = collect_futu(
+                futu_code,
+                host=args.futu_host,
+                port=args.futu_port,
+                start=start,
+                end=args.as_of,
+            )
+            warnings.extend(futu_warnings)
+        model_rows, model_warnings = load_model_evidence(code, Path(args.db_path), as_of=args.as_of)
+        warnings.extend(model_warnings)
+        stock_name = resolve_stock_name(code, futu_data, ashare_data, model_rows)
+        stock_dir = output_root / safe_directory_name(stock_name, code)
+        stock_dir.mkdir(parents=True, exist_ok=True)
+
+        raw = {
+            "metadata": {
+                "code": code,
+                "futu_code": futu_code,
+                "as_of": args.as_of,
+                "history_start": start,
+                "retrieved_at": dt.datetime.now().astimezone().isoformat(),
+                "language": args.language,
+                "stock_name": stock_name,
+                "asharehub_profile": args.asharehub_profile,
+                "asharehub_calls_this_stock": ashare_calls,
+                "asharehub_usage_ledger": str(usage_file),
+            },
+            "futu": futu_data,
+            "market_history": market_history,
+            "asharehub": ashare_data,
+            "model_evidence": model_rows,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+        derived = derive(raw)
+        raw_path = stock_dir / "research_raw.json"
+        derived_path = stock_dir / "research_derived.json"
+        brief_path = stock_dir / "research_brief.md"
+        write_json(raw_path, raw)
+        write_json(derived_path, derived)
+        brief_path.write_text(
+            render_brief(code, futu_code, args.as_of, derived, raw["warnings"], args.language),
+            encoding="utf-8",
+        )
+        print(f"[{futu_code}] raw={raw_path}")
+        print(f"[{futu_code}] derived={derived_path}")
+        print(f"[{futu_code}] brief={brief_path}")
+        if not futu_data and not ashare_data:
+            failures += 1
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

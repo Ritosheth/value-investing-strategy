@@ -53,7 +53,7 @@ X-API-Key: <read from ASHAREHUB_API_KEY>
 - **Business mix:** main-business; use official reports for narrative and footnotes.
 - **Catalysts:** forecast, express, disclosure-date, dividend, holder-trade, analyst-reports.
 - **Positioning:** margin, block trades, Dragon–Tiger, northbound holdings, money flow.
-- **Entry/timing:** technical factors and chips, cross-checked with non-Futu historical bars; Futu may supplement only the live snapshot/flow context.
+- **Entry/timing:** technical factors and chips, cross-checked with Futu price/flow.
 - **Peer context:** SW2021 industries plus daily valuation.
 
 ## Data caveats
@@ -74,7 +74,7 @@ X-API-Key: <read from ASHAREHUB_API_KEY>
 
 1. Official exchange/company/regulator filing text.
 2. Point-in-time structured AShareHub records with announcement dates.
-3. Non-Futu Tencent/Sina/Eastmoney historical bars, plus Futu live snapshot/flow data for overlapping current fields.
+3. Futu structured/live data for market, flow, and overlapping fields.
 4. Secondary news and analyst interpretation.
 
 When Futu and AShareHub disagree, report both timestamps, field definitions, units, and adjustment conventions. Do not silently choose one.

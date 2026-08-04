@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""Local launcher for the project's deep stock research collector.
-
-This server intentionally uses only the Python standard library so it can be
-started on a clean macOS installation. It creates a reproducible evidence
-bundle and saves the user's research request next to the generated brief.
-"""
+"""One-click local web interface for Deep Stock Research."""
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import subprocess
-import sys
 import threading
 import uuid
 import webbrowser
@@ -24,12 +19,14 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UI_ROOT = PROJECT_ROOT / "deep-stock-research" / "ui"
-COLLECTOR = PROJECT_ROOT / "deep-stock-research" / "scripts" / "collect_deep_research_data.py"
-EVIDENCE_COLLECTOR = PROJECT_ROOT / "deep-stock-research" / "scripts" / "collect_futu_evidence.py"
-RUNTIME = PROJECT_ROOT / "stock_investment_system" / "env.sh"
-OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "deep_research"
+APP_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = APP_ROOT.parent
+UI_ROOT = APP_ROOT / "ui"
+COLLECTOR = APP_ROOT / "scripts" / "collect_deep_research_data.py"
+SRC_ROOT = APP_ROOT / "src"
+PYTHON = WORKSPACE_ROOT / "stock_investment_system" / ".venv313" / "bin" / "python"
+OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "deep_research"
+RUNTIME_ROOT = APP_ROOT / ".runtime"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
@@ -38,167 +35,130 @@ JOBS_LOCK = threading.Lock()
 
 
 def normalize_codes(raw: str) -> list[str]:
-    """Keep the UI forgiving while passing only supported ticker formats on."""
     values = re.split(r"[,，;；\s]+", raw.strip())
     result: list[str] = []
     for value in values:
         if not value:
             continue
         code = value.upper().replace("_", ".")
-        if re.fullmatch(r"\d{6}(?:\.(?:SH|SZ|BJ))?", code):
+        if re.fullmatch(r"(?:SH\.|SZ\.)?\d{6}", code):
             result.append(code)
-        elif re.fullmatch(r"\d{1,5}\.HK", code):
+        elif re.fullmatch(r"(?:HK\.)?\d{5}", code):
             result.append(code)
-        elif re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}(?:\.US)?", code):
+        elif re.fullmatch(r"(?:US\.)?[A-Z][A-Z0-9.-]{0,9}", code):
             result.append(code)
     return list(dict.fromkeys(result))
 
 
-def safe_dir_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", value).strip("_") or "stock"
-
-
-def ticker_dir(code: str, as_of: date) -> Path:
-    """Mirror the collector's path convention without importing its module."""
-    normalized = code.upper().replace("_", ".")
-    if re.fullmatch(r"\d{6}", normalized):
-        suffix = "SH" if normalized.startswith("6") else "BJ" if normalized.startswith(("4", "8")) else "SZ"
-        name = f"{normalized}.{suffix}"
-    elif re.fullmatch(r"\d{1,5}\.HK", normalized):
-        name = f"{normalized.split('.')[0].zfill(5)}.HK"
-    elif re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", normalized):
-        name = normalized
-    else:
-        name = f"{normalized.removesuffix('.US')}.US"
-    return OUTPUT_ROOT / as_of.strftime("%Y%m%d") / safe_dir_name(name)
-
-
-def find_output_dir(code: str, as_of: date) -> Path:
-    """Find the collector directory, whose name is the issuer name when known."""
-    date_dir = OUTPUT_ROOT / as_of.strftime("%Y%m%d")
-    expected_code = code.upper().replace("_", ".")
-    if re.fullmatch(r"\d{6}", expected_code):
-        suffix = "SH" if expected_code.startswith("6") else "BJ" if expected_code.startswith(("4", "8")) else "SZ"
-        expected_code = f"{expected_code}.{suffix}"
-    code_dir = ticker_dir(code, as_of)
-    named_matches: list[Path] = []
-    code_match: Path | None = None
-    if date_dir.is_dir():
-        for child in date_dir.iterdir():
-            derived_path = child / "research_derived.json"
-            if not derived_path.is_file():
-                continue
-            try:
-                derived = json.loads(derived_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            ticker = derived.get("ticker", {}) if isinstance(derived, dict) else {}
-            if isinstance(ticker, dict) and ticker.get("code") == expected_code:
-                if child == code_dir:
-                    code_match = child
-                else:
-                    named_matches.append(child)
-    if named_matches:
-        return sorted(named_matches)[0]
-    return code_match or code_dir
+def health() -> dict[str, Any]:
+    return {
+        "python_ready": PYTHON.is_file(),
+        "python_version": ".".join(map(str, __import__("sys").version_info[:3])),
+        "asharehub_ready": importlib.util.find_spec("asharehub") is not None,
+        "asharehub_key_ready": bool(os.environ.get("ASHAREHUB_API_KEY")),
+        "akshare_ready": importlib.util.find_spec("akshare") is not None,
+        "futu_ready": importlib.util.find_spec("futu") is not None,
+        "output_root": str(OUTPUT_ROOT),
+    }
 
 
 def request_markdown(payload: dict[str, Any], codes: list[str], as_of: date) -> str:
-    lines = [
-        "# 深度股票研究请求",
-        "",
-        f"- 提交时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
-        f"- 研究截止日：{as_of.isoformat()}",
-        f"- 股票代码：{', '.join(codes)}",
-        f"- 投资风格：{payload.get('style') or '未指定'}",
-        f"- 持有周期：{payload.get('horizon') or '未指定'}",
-        f"- 风险偏好：{payload.get('risk') or '未指定'}",
-        f"- 研究深度：{payload.get('depth') or '标准尽调'}",
-        "",
-        "## 用户研究要求",
-        "",
-        (payload.get("requirement") or "未填写"),
-        "",
-        "## 运行说明",
-        "",
-        "本次启动器已先读取本地选股模型和 Futu/OpenD 的只读行情、财务、估值、资金流、公司资料，再生成 research_raw.json、research_derived.json、research_brief.md。",
-        "research_brief.md 是可复现的证据简报，不等同于完整的联网深度研究结论；缺失数据会保留为证据缺口。",
-    ]
-    return "\n".join(lines) + "\n"
+    return "\n".join(
+        [
+            "# 深度股票研究请求",
+            "",
+            f"- 提交时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
+            f"- 研究截止日：{as_of.isoformat()}",
+            f"- 股票代码：{', '.join(codes)}",
+            f"- 数据配置：AShareHub={'启用' if payload.get('use_asharehub', True) else '停用'}；Futu={'启用' if payload.get('use_futu') else '停用'}",
+            "",
+            "## 研究要求",
+            "",
+            str(payload.get("requirement") or "生成标准深度研究证据底稿。"),
+            "",
+            "## 说明",
+            "",
+            "本文件由本机一键界面保存。research_brief.md 是数据证据底稿，不等同于自动买卖建议。",
+            "",
+        ]
+    )
+
+
+def output_directories(stdout: str) -> list[Path]:
+    directories: list[Path] = []
+    for line in stdout.splitlines():
+        match = re.search(r"\bbrief=(.+)$", line.strip())
+        if match:
+            path = Path(match.group(1)).expanduser()
+            directories.append(path.parent)
+    return list(dict.fromkeys(directories))
 
 
 def run_job(job_id: str, payload: dict[str, Any], codes: list[str]) -> None:
-    as_of = date.today()
     with JOBS_LOCK:
         JOBS[job_id].update(status="running", started_at=datetime.now().isoformat(timespec="seconds"))
 
     try:
-        evidence_path = OUTPUT_ROOT / as_of.strftime("%Y%m%d") / "evidence_bundle.json"
-        evidence_command = [str(RUNTIME), str(EVIDENCE_COLLECTOR), *codes, "--output", str(evidence_path)]
-        evidence_env = os.environ.copy()
-        evidence_env.setdefault("FUTU_SKILL_ROOT", str(Path.home() / ".codex" / "skills" / "futuapi" / "scripts"))
-        evidence_run = subprocess.run(
-            evidence_command,
-            cwd=str(PROJECT_ROOT),
-            text=True,
-            capture_output=True,
-            timeout=1200,
-            check=False,
-            env=evidence_env,
-        )
-        if evidence_run.returncode != 0:
-            raise RuntimeError((evidence_run.stderr or evidence_run.stdout or "Futu/OpenD 证据采集失败").strip())
+        as_of = date.fromisoformat(str(payload.get("as_of") or date.today().isoformat()))
+        use_asharehub = bool(payload.get("use_asharehub", True))
+        use_futu = bool(payload.get("use_futu", False))
+        if use_asharehub and not os.environ.get("ASHAREHUB_API_KEY"):
+            raise RuntimeError("未读取到 AShareHub API Key。请关闭系统，在终端配置后重新双击启动。")
 
+        date_root = OUTPUT_ROOT / as_of.strftime("%Y%m%d")
         command = [
-            str(RUNTIME),
+            str(PYTHON),
             str(COLLECTOR),
             *codes,
-            "--output-root",
-            str(OUTPUT_ROOT),
             "--as-of",
             as_of.isoformat(),
-            "--horizon",
-            str(payload.get("horizon") or "MEDIUM").upper(),
+            "--output-dir",
+            str(date_root),
             "--language",
             "zh-CN",
-            "--risk-profile",
-            str(payload.get("risk") or "平衡"),
-            "--investment-style",
-            str(payload.get("style") or "未指定"),
-            "--research-depth",
-            str(payload.get("depth") or "标准尽调"),
-            "--evidence-json",
-            str(evidence_path),
+            "--asharehub-profile",
+            str(payload.get("profile") or "core"),
         ]
+        if not use_asharehub:
+            command.append("--skip-asharehub")
+        if not use_futu:
+            command.append("--skip-futu")
+        if payload.get("refresh"):
+            command.append("--refresh-asharehub")
+
+        process_env = os.environ.copy()
+        process_env["PYTHONPATH"] = str(SRC_ROOT)
+        process_env["PYTHONPYCACHEPREFIX"] = str(RUNTIME_ROOT / "pycache")
         completed = subprocess.run(
             command,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(APP_ROOT),
             text=True,
             capture_output=True,
-            timeout=300,
+            timeout=1800,
             check=False,
+            env=process_env,
         )
+        directories = output_directories(completed.stdout)
         request_text = request_markdown(payload, codes, as_of)
-        output_dirs: list[str] = []
-        for code in codes:
-            directory = find_output_dir(code, as_of)
+        for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "research_request.md").write_text(request_text, encoding="utf-8")
-            output_dirs.append(str(directory))
 
         if completed.returncode != 0:
-            raise RuntimeError((completed.stderr or completed.stdout or "采集器运行失败").strip())
+            message = (completed.stderr or completed.stdout or "采集器运行失败").strip()
+            raise RuntimeError(message)
+        if not directories:
+            raise RuntimeError("采集器已结束，但没有找到输出目录。")
 
         with JOBS_LOCK:
             JOBS[job_id].update(
                 status="complete",
                 finished_at=datetime.now().isoformat(timespec="seconds"),
-                stdout=("[Futu/OpenD evidence]\n" + evidence_run.stdout + "\n[collector]\n" + completed.stdout),
-                stderr=(evidence_run.stderr + "\n" + completed.stderr).strip(),
-                output_dirs=output_dirs,
-                evidence_file=str(evidence_path),
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                output_dirs=[str(path) for path in directories],
             )
-    except Exception as exc:  # Keep the error visible in the UI instead of killing the server.
+    except Exception as exc:
         with JOBS_LOCK:
             JOBS[job_id].update(
                 status="error",
@@ -208,7 +168,7 @@ def run_job(job_id: str, payload: dict[str, Any], codes: list[str]) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "DeepStockResearchUI/1.0"
+    server_version = "DeepStockResearchUI/2.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -229,6 +189,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/index.html"}:
             self.send_bytes((UI_ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
             return
+        if parsed.path == "/api/health":
+            self.send_json(health())
+            return
         if parsed.path == "/api/status":
             job_id = parse_qs(parsed.query).get("id", [""])[0]
             with JOBS_LOCK:
@@ -241,7 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             if OUTPUT_ROOT.resolve() not in target.parents or not target.is_file():
                 self.send_json({"error": "文件不存在或路径无效"}, 404)
                 return
-            self.send_bytes(target.read_bytes(), "text/plain; charset=utf-8")
+            content_type = "application/json; charset=utf-8" if target.suffix == ".json" else "text/plain; charset=utf-8"
+            self.send_bytes(target.read_bytes(), content_type)
             return
         self.send_json({"error": "Not found"}, 404)
 
@@ -256,7 +220,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("请求内容格式错误")
             codes = normalize_codes(str(payload.get("codes", "")))
             if not codes:
-                raise ValueError("请至少填写一个有效股票代码，例如 600519、0700.HK 或 AAPL")
+                raise ValueError("请填写有效股票代码，例如 600519、HK.00700 或 US.AAPL")
+            if len(codes) > 3:
+                raise ValueError("单次最多研究 3 只股票，以免超过 AShareHub 免费额度。")
+            date.fromisoformat(str(payload.get("as_of") or date.today().isoformat()))
             job_id = uuid.uuid4().hex[:12]
             with JOBS_LOCK:
                 JOBS[job_id] = {"status": "queued", "codes": codes, "request": payload}
@@ -271,6 +238,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
+    if not PYTHON.is_file():
+        raise FileNotFoundError(f"Python 3.13 环境不存在：{PYTHON}")
     server = None
     selected_port = args.port
     for candidate in range(args.port, args.port + 10):
@@ -283,9 +252,9 @@ def main() -> None:
     if server is None:
         raise OSError(f"无法在 {args.port}-{args.port + 9} 端口启动本机研究界面")
     url = f"http://{HOST}:{selected_port}"
-    print(f"Deep Stock Research UI: {url}", flush=True)
+    print(f"深度股票研究系统已启动：{url}", flush=True)
     if args.open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

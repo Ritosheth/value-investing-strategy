@@ -12,9 +12,6 @@
 | Product/commodity prices | Margin drivers | Official exchanges, government price data, industry indices, or licensed APIs. |
 | Fund ownership beyond Stock Connect | Complete mutual-fund and institutional position history | Fund periodic-holdings or licensed institutional-ownership APIs. |
 | China macro/policy calendar | Domestic policy and releases | PBOC, NBS, MOF, customs, and official policy/data APIs. |
-| Overseas factory economics | Site capacity, utilization, yield, certification, local cost, incentives, tax expiry, capex, depreciation, working capital, and cash profitability | Company filings/IR, host-country investment authority, industrial-estate operator, tax/customs authority, and local statistics. |
-| Cross-border policy transmission | Binding investment terms, permits, ownership, repatriation, treaty protection, tariffs, anti-circumvention, export controls, and rules of origin across host and destination markets | Treaty/legal text; host-country ministry/regulator/customs; destination-market trade and export-control authorities; company disclosures. |
-| Bilateral/geopolitical stability | Commitments versus implementation, policy continuity, security frictions, and exposure to third-country pressure | Foreign ministries and leaders' joint statements from both countries, enacted agreements, host-country official records, and relevant third-country regulators. |
 
 Prefer point-in-time APIs with stable security IDs, publication and effective dates, revision status, original document URLs, pagination, and documented rate limits. Avoid latest-only overwritten values.
 

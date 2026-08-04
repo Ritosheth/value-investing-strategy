@@ -1,0 +1,4 @@
+pandas
+akshare
+futu-api
+asharehub>=0.7.0

@@ -1,4 +1,4 @@
 interface:
   display_name: "Deep Stock Research"
-  short_description: "Chinese evidence-backed research for selected stocks"
-  default_prompt: "Use $deep-stock-research to collect evidence and produce a Chinese deep-research report for these stocks."
+  short_description: "Causal, evidence-backed stock research"
+  default_prompt: "Use $deep-stock-research to produce a Chinese deep-research report that traces causal effects and interprets stock technicals relative to the same-cutoff market regime, industry, breadth, and risk state."
